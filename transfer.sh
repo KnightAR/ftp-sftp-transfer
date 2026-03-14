@@ -399,6 +399,8 @@ setup_logging() {
 }
 
 # log LEVEL "message"
+# Uses flock on the log file so that concurrent workers never interleave
+# partial lines into the same log entry.  Each call is one atomic append.
 log() {
     local level="$1"
     local message="$2"
@@ -406,24 +408,33 @@ log() {
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     local line="[${timestamp}] [${level}]  ${message}"
 
-    # Always write to general log
-    echo "${line}" >> "${LOG_FILE}"
-
-    # Write errors to dedicated error log as well
+    # Determine stdout output before acquiring the lock (date call is already done)
+    local print_stdout=false
     if [[ "${level}" == "ERROR" ]]; then
-        echo "${line}" >> "${ERROR_LOG_FILE}"
-    fi
-
-    # Write to stdout based on level and verbosity
-    if [[ "${level}" == "ERROR" ]]; then
-        echo "${line}" >&2
+        print_stdout=true
     elif [[ "${level}" == "WARN" ]]; then
-        echo "${line}"
+        print_stdout=true
     elif [[ "${level}" == "INFO" ]]; then
-        echo "${line}"
+        print_stdout=true
     elif [[ "${level}" == "DEBUG" ]] && [[ "${CLI_VERBOSE}" == true ]]; then
-        echo "${line}"
+        print_stdout=true
     fi
+
+    # Atomic write: flock on the general log file descriptor
+    (
+        flock -x 200
+        echo "${line}" >> "${LOG_FILE}"
+        if [[ "${level}" == "ERROR" ]]; then
+            echo "${line}" >> "${ERROR_LOG_FILE}"
+        fi
+        if [[ "${print_stdout}" == true ]]; then
+            if [[ "${level}" == "ERROR" ]]; then
+                echo "${line}" >&2
+            else
+                echo "${line}"
+            fi
+        fi
+    ) 200>"${LOG_FILE}.lock"
 }
 
 rotate_logs() {
@@ -787,23 +798,80 @@ sftp_get_size() {
     local remote_basename
     remote_basename=$(basename "${remote_path}")
 
-    result=$(SSHPASS="${SFTP_PASS}" sshpass -e sftp \
+    # Capture raw SFTP output into a variable so we can both log it (in verbose
+    # mode) and feed it to awk — avoids a second round-trip to the server.
+    local raw_ls
+    raw_ls=$(SSHPASS="${SFTP_PASS}" sshpass -e sftp \
         -P "${SFTP_PORT}" \
         -o StrictHostKeyChecking=no \
         -o BatchMode=no \
         -o ConnectTimeout=15 \
         -o LogLevel=ERROR \
         -b <(printf 'ls -l %s\n' "${remote_path}") \
-        "${SFTP_USER}@${SFTP_HOST}" 2>/dev/null \
+        "${SFTP_USER}@${SFTP_HOST}" 2>/dev/null || true)
+
+    result=$(printf '%s\n' "${raw_ls}" \
         | awk -v name="${remote_basename}" \
             'NF>=9 && /^[-]/ && ($NF==name || substr($NF,length($NF)-length(name),1)=="/" && substr($NF,length($NF)-length(name)+1)==name) {print $5}' \
         | head -1)
+
+    # In verbose mode: emit one single atomic log entry containing the query,
+    # every raw ls line, and the matched result — keeping it as one log() call
+    # so it is written under one flock and never interleaved with other workers.
+    if [[ "${CLI_VERBOSE}" == true ]]; then
+        local dbg_msg="sftp_get_size: path=${remote_path} basename=${remote_basename} result='${result:-NOT_FOUND}'"
+        if [[ -z "${raw_ls}" ]]; then
+            dbg_msg+=" | raw=<empty>"
+        else
+            local raw_line
+            while IFS= read -r raw_line; do
+                dbg_msg+=" | ${raw_line}"
+            done <<< "${raw_ls}"
+        fi
+        log "DEBUG" "${dbg_msg}"
+    fi
 
     if [[ -z "${result}" ]]; then
         echo "NOT_FOUND"
     else
         echo "${result}"
     fi
+}
+
+# sftp_get_size_retry REMOTE_PATH EXPECTED_SIZE [MAX_TRIES] [SLEEP_SECS]
+#
+# Calls sftp_get_size up to MAX_TRIES times (default 4), sleeping SLEEP_SECS
+# (default 3) between attempts, until the returned size equals EXPECTED_SIZE.
+#
+# Returns the size once it matches, or the last value seen if it never matches.
+#
+# Rationale: some SFTP servers (especially object-storage backends) do not
+# reflect the final file size in ls -l immediately after a put completes —
+# they may return a partial/chunk size (e.g. 262144000 = 256 MiB) for a few
+# seconds while the write is being committed.  Retrying avoids false-positive
+# "Upload size verification failed" errors on large files.
+sftp_get_size_retry() {
+    local remote_path="$1"
+    local expected_size="$2"
+    local max_tries="${3:-4}"
+    local sleep_secs="${4:-3}"
+
+    local attempt=1
+    local size
+    while (( attempt <= max_tries )); do
+        size=$(sftp_get_size "${remote_path}")
+        if [[ "${size}" == "${expected_size}" ]]; then
+            echo "${size}"
+            return 0
+        fi
+        if (( attempt < max_tries )); then
+            log "DEBUG" "sftp_get_size_retry: attempt ${attempt}/${max_tries} got '${size}', expected '${expected_size}' — retrying in ${sleep_secs}s (${remote_path})"
+            sleep "${sleep_secs}"
+        fi
+        (( attempt++ )) || true
+    done
+    # Return whatever we last got (caller decides if it's an error)
+    echo "${size}"
 }
 
 # Create a directory path recursively on SFTP
@@ -1443,9 +1511,12 @@ EOF
                     continue
                 fi
 
-                # Verify upload by re-checking size on SFTP
+                # Verify upload by re-checking size on SFTP.
+                # Uses sftp_get_size_retry (up to 4 attempts, 3s apart) because some
+                # object-storage SFTP backends report a partial/chunk size immediately
+                # after put completes and need a moment to commit the final file size.
                 local post_size
-                post_size=$(sftp_get_size "${sftp_dest_path}")
+                post_size=$(sftp_get_size_retry "${sftp_dest_path}" "${ftp_size}")
                 if [[ "${post_size}" != "${ftp_size}" ]]; then
                     log "ERROR" "[UL${worker_id}] Upload size verification failed (expected=${ftp_size}, sftp_reported=${post_size}): ${sftp_dest_path}"
                     rm -f "${local_path}"
