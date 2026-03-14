@@ -3,21 +3,23 @@
 # transfer.sh — FTP to SFTP Transfer Script
 #
 # Purpose : Mirror files from an FTP server to an SFTP server,
-#           with size-based overwrite detection, parallel
-#           workers, mtime-based FTP retention/deletion, and
-#           structured logging.
+#           with size-based overwrite detection, decoupled
+#           parallel FTP download + SFTP upload workers,
+#           disk-space guarding, mtime-based FTP retention/
+#           deletion, and structured logging.
 #
 # OS      : Ubuntu Linux
 # Requires: lftp, sshpass, sftp (openssh-client)
 #
 # Usage   : ./transfer.sh [OPTIONS]
-#   -c FILE   Path to config file       (default: ./transfer.conf)
-#   -e FILE   Path to exclusion list    (default: value in config)
-#   -t DIR    Override temp directory   (this run only)
-#   -d        Enable dry-run mode       (this run only)
-#   -n        Disable FTP deletion      (this run only)
-#   -p N      Override max parallel workers (this run only)
-#   -v        Verbose / DEBUG to stdout (this run only)
+#   -c FILE   Path to config file           (default: ./transfer.conf)
+#   -e FILE   Path to exclusion list        (default: value in config)
+#   -t DIR    Override temp directory       (this run only)
+#   -d        Enable dry-run mode           (this run only)
+#   -n        Disable FTP deletion          (this run only)
+#   -f N      Override FTP download workers (this run only)
+#   -s N      Override SFTP upload workers  (this run only)
+#   -v        Verbose / DEBUG to stdout     (this run only)
 #   -h        Show this help message
 #
 # ============================================================
@@ -33,7 +35,7 @@ SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_NAME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="2.0.0"
 
 # Default config path (overridden by -c flag)
 DEFAULT_CONFIG="${SCRIPT_DIR}/transfer.conf"
@@ -47,6 +49,10 @@ TEMP_DIR_CREATED=false
 LOG_FILE=""
 ERROR_LOG_FILE=""
 FTP_CONNECT_STR=""       # Assembled lftp connection string
+
+# Worker PID tracking — populated by run_pipeline, read by trap_cleanup
+# so that Ctrl+C / SIGTERM kills workers before staging is deleted
+WORKER_PIDS=()
 
 # Counters (updated by workers via temp files, merged at end)
 CNT_SCANNED=0
@@ -69,7 +75,8 @@ CLI_EXCLUDE_LIST=""
 CLI_TEMP_DIR=""
 CLI_DRY_RUN=""
 CLI_DELETE_FROM_FTP=""
-CLI_MAX_PARALLEL=""
+CLI_FTP_WORKERS=""
+CLI_SFTP_WORKERS=""
 CLI_VERBOSE=false
 
 usage() {
@@ -79,32 +86,35 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION} — FTP to SFTP Transfer Script
 Usage: ${SCRIPT_NAME} [OPTIONS]
 
 Options:
-  -c FILE   Path to config file           (default: ./transfer.conf)
-  -e FILE   Path to exclusion list        (default: value in config)
-  -t DIR    Override temp/staging dir     (this run only)
-  -d        Enable dry-run mode           (no files moved or deleted)
-  -n        Disable FTP deletion          (transfer only, no deletes)
-  -p N      Override max parallel workers (this run only)
-  -v        Verbose output (DEBUG level)  (stdout + log)
+  -c FILE   Path to config file               (default: ./transfer.conf)
+  -e FILE   Path to exclusion list            (default: value in config)
+  -t DIR    Override temp/staging dir         (this run only)
+  -d        Enable dry-run mode               (no files moved or deleted)
+  -n        Disable FTP deletion              (transfer only, no deletes)
+  -f N      Override FTP download workers     (this run only)
+  -s N      Override SFTP upload workers      (this run only)
+  -v        Verbose output (DEBUG level)      (stdout + log)
   -h        Show this help message
 
 Examples:
-  ${SCRIPT_NAME}                          # Normal run with ./transfer.conf
-  ${SCRIPT_NAME} -d                       # Dry run (no changes made)
-  ${SCRIPT_NAME} -d -v                    # Dry run with verbose output
-  ${SCRIPT_NAME} -c /etc/transfer.conf    # Use alternate config file
-  ${SCRIPT_NAME} -n -p 1                  # No FTP deletion, single worker
+  ${SCRIPT_NAME}                              # Normal run with ./transfer.conf
+  ${SCRIPT_NAME} -d                           # Dry run (no changes made)
+  ${SCRIPT_NAME} -d -v                        # Dry run with verbose output
+  ${SCRIPT_NAME} -c /etc/transfer.conf        # Use alternate config file
+  ${SCRIPT_NAME} -n -f 1                      # No FTP deletion, single download worker
+  ${SCRIPT_NAME} -f 2 -s 10                   # 2 FTP downloaders, 10 SFTP uploaders
 EOF
     exit 0
 }
 
 parse_args() {
-    while getopts ":c:e:t:p:dnvh" opt; do
+    while getopts ":c:e:t:f:s:dnvh" opt; do
         case "${opt}" in
             c) CLI_CONFIG="${OPTARG}" ;;
             e) CLI_EXCLUDE_LIST="${OPTARG}" ;;
             t) CLI_TEMP_DIR="${OPTARG}" ;;
-            p) CLI_MAX_PARALLEL="${OPTARG}" ;;
+            f) CLI_FTP_WORKERS="${OPTARG}" ;;
+            s) CLI_SFTP_WORKERS="${OPTARG}" ;;
             d) CLI_DRY_RUN="true" ;;
             n) CLI_DELETE_FROM_FTP="false" ;;
             v) CLI_VERBOSE=true ;;
@@ -140,11 +150,29 @@ load_config() {
     source "${config_file}"
 
     # Apply CLI overrides (flags take precedence over config values)
-    [[ -n "${CLI_EXCLUDE_LIST}" ]]  && EXCLUDE_LIST="${CLI_EXCLUDE_LIST}"
-    [[ -n "${CLI_TEMP_DIR}" ]]      && TEMP_DIR="${CLI_TEMP_DIR}"
-    [[ -n "${CLI_DRY_RUN}" ]]       && DRY_RUN="${CLI_DRY_RUN}"
+    [[ -n "${CLI_EXCLUDE_LIST}" ]]    && EXCLUDE_LIST="${CLI_EXCLUDE_LIST}"
+    [[ -n "${CLI_TEMP_DIR}" ]]        && TEMP_DIR="${CLI_TEMP_DIR}"
+    [[ -n "${CLI_DRY_RUN}" ]]         && DRY_RUN="${CLI_DRY_RUN}"
     [[ -n "${CLI_DELETE_FROM_FTP}" ]] && DELETE_FROM_FTP="${CLI_DELETE_FROM_FTP}"
-    [[ -n "${CLI_MAX_PARALLEL}" ]]  && MAX_PARALLEL="${CLI_MAX_PARALLEL}"
+    [[ -n "${CLI_FTP_WORKERS}" ]]     && FTP_MAX_WORKERS="${CLI_FTP_WORKERS}"
+    [[ -n "${CLI_SFTP_WORKERS}" ]]    && SFTP_MAX_WORKERS="${CLI_SFTP_WORKERS}"
+
+    # Apply defaults for optional variables not set in the config file.
+    # Credentials and host/path values have no safe defaults and are
+    # validated strictly in validate_config — everything else falls back silently.
+    : "${RETENTION_DAYS:=7}"
+    : "${FTP_MAX_WORKERS:=2}"
+    : "${SFTP_MAX_WORKERS:=10}"
+    : "${LOG_DIR:=./logs}"
+    : "${LOG_RETENTION_DAYS:=30}"
+    : "${DISK_SPACE_BUFFER_PCT:=10}"
+    : "${DISK_WAIT_TIMEOUT:=300}"
+    : "${DISK_WAIT_INTERVAL:=10}"
+    : "${DRY_RUN:=false}"
+    : "${DELETE_FROM_FTP:=true}"
+    : "${OVERWRITE_ON_SIZE_DIFF:=true}"
+    : "${EXCLUDE_LIST:=}"
+    : "${TEMP_DIR:=}"
 
     validate_config
 }
@@ -152,6 +180,8 @@ load_config() {
 validate_config() {
     local errors=0
 
+    # Only credentials and server addresses have no safe default —
+    # everything else was already defaulted in load_config.
     check_var() {
         local var_name="$1"
         local var_value="${!var_name:-}"
@@ -171,30 +201,43 @@ validate_config() {
     check_var "SFTP_USER"
     check_var "SFTP_PASS"
     check_var "SFTP_REMOTE_DIR"
-    check_var "RETENTION_DAYS"
-    check_var "MAX_PARALLEL"
-    check_var "LOG_DIR"
-    check_var "LOG_RETENTION_DAYS"
 
-    # Validate numeric values
-    if ! [[ "${RETENTION_DAYS:-}" =~ ^[0-9]+$ ]]; then
-        echo "ERROR: RETENTION_DAYS must be a positive integer, got: '${RETENTION_DAYS:-}'" >&2
+    # Validate that numeric vars (whether from config or defaults) are actually numbers.
+    # These checks catch the case where a user sets a variable to a non-numeric value.
+    if ! [[ "${FTP_PORT}"              =~ ^[0-9]+$ ]]; then
+        echo "ERROR: FTP_PORT must be a number, got: '${FTP_PORT}'" >&2
         (( errors++ )) || true
     fi
-    if ! [[ "${MAX_PARALLEL:-}" =~ ^[1-9][0-9]*$ ]]; then
-        echo "ERROR: MAX_PARALLEL must be a positive integer, got: '${MAX_PARALLEL:-}'" >&2
+    if ! [[ "${SFTP_PORT}"             =~ ^[0-9]+$ ]]; then
+        echo "ERROR: SFTP_PORT must be a number, got: '${SFTP_PORT}'" >&2
         (( errors++ )) || true
     fi
-    if ! [[ "${LOG_RETENTION_DAYS:-}" =~ ^[0-9]+$ ]]; then
-        echo "ERROR: LOG_RETENTION_DAYS must be a positive integer, got: '${LOG_RETENTION_DAYS:-}'" >&2
+    if ! [[ "${RETENTION_DAYS}"        =~ ^[0-9]+$ ]]; then
+        echo "ERROR: RETENTION_DAYS must be a non-negative integer, got: '${RETENTION_DAYS}'" >&2
         (( errors++ )) || true
     fi
-    if ! [[ "${FTP_PORT:-}" =~ ^[0-9]+$ ]]; then
-        echo "ERROR: FTP_PORT must be a number, got: '${FTP_PORT:-}'" >&2
+    if ! [[ "${FTP_MAX_WORKERS}"       =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: FTP_MAX_WORKERS must be a positive integer, got: '${FTP_MAX_WORKERS}'" >&2
         (( errors++ )) || true
     fi
-    if ! [[ "${SFTP_PORT:-}" =~ ^[0-9]+$ ]]; then
-        echo "ERROR: SFTP_PORT must be a number, got: '${SFTP_PORT:-}'" >&2
+    if ! [[ "${SFTP_MAX_WORKERS}"      =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: SFTP_MAX_WORKERS must be a positive integer, got: '${SFTP_MAX_WORKERS}'" >&2
+        (( errors++ )) || true
+    fi
+    if ! [[ "${LOG_RETENTION_DAYS}"    =~ ^[0-9]+$ ]]; then
+        echo "ERROR: LOG_RETENTION_DAYS must be a non-negative integer, got: '${LOG_RETENTION_DAYS}'" >&2
+        (( errors++ )) || true
+    fi
+    if ! [[ "${DISK_SPACE_BUFFER_PCT}" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: DISK_SPACE_BUFFER_PCT must be an integer 0-99, got: '${DISK_SPACE_BUFFER_PCT}'" >&2
+        (( errors++ )) || true
+    fi
+    if ! [[ "${DISK_WAIT_TIMEOUT}"     =~ ^[0-9]+$ ]]; then
+        echo "ERROR: DISK_WAIT_TIMEOUT must be a non-negative integer, got: '${DISK_WAIT_TIMEOUT}'" >&2
+        (( errors++ )) || true
+    fi
+    if ! [[ "${DISK_WAIT_INTERVAL}"    =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: DISK_WAIT_INTERVAL must be a positive integer, got: '${DISK_WAIT_INTERVAL}'" >&2
         (( errors++ )) || true
     fi
 
@@ -261,7 +304,6 @@ check_dependencies() {
 
     # Detect whether we are running interactively
     if [[ -t 0 ]]; then
-        # Interactive terminal — prompt the user
         local answer=""
         while true; do
             read -rp " Would you like to run this command now? [y/N]: " answer
@@ -276,7 +318,6 @@ check_dependencies() {
                         echo "------------------------------------------------------------"
                         echo " Installation complete. Re-checking dependencies..."
                         echo ""
-                        # Re-verify all binaries are now present
                         local still_missing=()
                         for binary in "${missing[@]}"; do
                             if ! command -v "${binary}" &>/dev/null; then
@@ -412,25 +453,42 @@ release_lock() {
 
 setup_temp_dir() {
     if [[ -n "${TEMP_DIR:-}" ]]; then
-        # User-specified temp dir
         mkdir -p "${TEMP_DIR}"
         chmod 700 "${TEMP_DIR}"
         log "DEBUG" "Using custom temp directory: ${TEMP_DIR}"
     else
-        # Create a secure system temp dir
         TEMP_DIR=$(mktemp -d -t ftp_sftp_XXXXXXXXXX)
         chmod 700 "${TEMP_DIR}"
         TEMP_DIR_CREATED=true
         log "DEBUG" "Created temp directory: ${TEMP_DIR}"
     fi
 
-    # Create staging subdirectories for workers
+    # Staging subdirectories for workers
     mkdir -p "${TEMP_DIR}/staging"
     mkdir -p "${TEMP_DIR}/workers"
 
-    # Work queue files
+    # ---- Queue files ----
+    # work_queue.txt      : SIZE EPOCH PATH — files to download from FTP (space-separated)
+    # ready_queue.txt     : LOCAL_PATH\tSFTP_DEST_PATH\tFTP_PATH\tFTP_SIZE\tFTP_MTIME
+    #                       files downloaded and waiting for SFTP upload
+    #                       LOCAL_PATH="SKIP"   — already on SFTP, retention check only
+    #                       LOCAL_PATH="DRYRUN" — dry-run mode, log only
+    # confirmed_queue.txt : FTP_PATH\tFTP_SIZE\tFTP_MTIME — uploads confirmed, check retention
     touch "${TEMP_DIR}/work_queue.txt"
     touch "${TEMP_DIR}/work_queue.lock"
+    touch "${TEMP_DIR}/ready_queue.txt"
+    touch "${TEMP_DIR}/ready_queue.lock"
+    touch "${TEMP_DIR}/confirmed_queue.txt"
+    touch "${TEMP_DIR}/confirmed_queue.lock"
+
+    # ---- Shared atomic counter files ----
+    # in_flight_bytes.cnt    : bytes currently reserved for active downloads
+    # active_downloaders.cnt : number of running FTP download worker processes
+    # active_uploaders.cnt   : number of running SFTP upload worker processes
+    echo "0" > "${TEMP_DIR}/in_flight_bytes.cnt"
+    echo "0" > "${TEMP_DIR}/active_downloaders.cnt"
+    echo "0" > "${TEMP_DIR}/active_uploaders.cnt"
+    touch "${TEMP_DIR}/counters.lock"
 }
 
 cleanup_temp() {
@@ -438,13 +496,17 @@ cleanup_temp() {
         rm -rf "${TEMP_DIR}"
         log "DEBUG" "Removed temp directory: ${TEMP_DIR}"
     else
-        # Custom temp dir — only clean up contents, not the dir itself
         if [[ -d "${TEMP_DIR:-}" ]]; then
             rm -rf "${TEMP_DIR:?}/staging"
             rm -rf "${TEMP_DIR:?}/workers"
             rm -rf "${TEMP_DIR:?}/mirror_dummy"
-            rm -f  "${TEMP_DIR}/work_queue.txt"
-            rm -f  "${TEMP_DIR}/work_queue.lock"
+            rm -f  "${TEMP_DIR}/work_queue.txt"      "${TEMP_DIR}/work_queue.lock"
+            rm -f  "${TEMP_DIR}/ready_queue.txt"     "${TEMP_DIR}/ready_queue.lock"
+            rm -f  "${TEMP_DIR}/confirmed_queue.txt" "${TEMP_DIR}/confirmed_queue.lock"
+            rm -f  "${TEMP_DIR}/in_flight_bytes.cnt"
+            rm -f  "${TEMP_DIR}/active_downloaders.cnt"
+            rm -f  "${TEMP_DIR}/active_uploaders.cnt"
+            rm -f  "${TEMP_DIR}/counters.lock"
             rm -f  "${TEMP_DIR}/ftp_listing.txt"
             log "DEBUG" "Cleaned contents of custom temp directory: ${TEMP_DIR}"
         fi
@@ -455,7 +517,6 @@ cleanup_temp() {
 # SECTION 8 — EXCLUSION LIST
 # ============================================================
 
-# Global array to hold loaded exclusion patterns
 EXCLUSION_PATTERNS=()
 
 load_exclusions() {
@@ -466,12 +527,9 @@ load_exclusions() {
 
     local count=0
     while IFS= read -r line; do
-        # Strip inline comments
         line="${line%%#*}"
-        # Strip leading/trailing whitespace
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
-        # Skip empty lines
         [[ -z "${line}" ]] && continue
         EXCLUSION_PATTERNS+=("${line}")
         (( count++ )) || true
@@ -498,16 +556,10 @@ is_excluded() {
 # ============================================================
 
 setup_ftp_connection() {
-    # TLS is explicitly disabled — the server does not use or support TLS.
-    # This matches the working lftp invocation:
-    #   lftp -e "set ftp:ssl-allow no; ls /; quit" -u user,pass host
     FTP_CONNECT_STR="set ftp:ssl-allow no; set net:timeout 30; set net:max-retries 3;"
 
     log "INFO" "FTP connection configured — plain FTP (TLS disabled) to ${FTP_HOST}:${FTP_PORT}"
 
-    # Verify the connection is reachable before proceeding
-    # Host is passed as a positional argument (not inside -e) matching:
-    #   lftp -e "set ftp:ssl-allow no; ls /; quit" -u user,pass host
     local test_result
     test_result=$(lftp \
         -e "${FTP_CONNECT_STR} ls; quit" \
@@ -525,8 +577,6 @@ setup_ftp_connection() {
 }
 
 # Run an lftp command against the FTP server
-# Matches the working manual invocation:
-#   lftp -e "set ftp:ssl-allow no; <cmds>; quit" -u user,pass host
 # Usage: run_lftp <lftp_commands>
 run_lftp() {
     local cmds="$1"
@@ -573,7 +623,7 @@ get_ftp_file_list() {
     # Parse full FTP paths from mirror output
     true > "${paths_file}"
     while IFS= read -r line; do
-        if [[ "${line}" =~ ^"Transferring file "\`([^\']*)\' ]]; then
+        if [[ "${line}" =~ ^"Transferring file "\`([^\']*)\'  ]]; then
             local relpath="${BASH_REMATCH[1]}"
             if [[ "${FTP_REMOTE_DIR}" == "/" ]]; then
                 printf '/%s\n' "${relpath}" >> "${paths_file}"
@@ -602,13 +652,12 @@ get_ftp_file_list() {
     # ls output format: perms links owner group SIZE MON DD TIME/YEAR NAME
     # e.g: -rw-r--r-- 1 100 ftpgroup 52428800 Jan 05 2025 helium_rewards_20250105.sql.bz2
     # run_lftp output is saved to a temp file before parsing (not piped).
+    # NOTE: IFS=' ' is set locally on each read call because the global
+    #       IFS=$'\n\t' does not split on spaces.
     # ----------------------------------------------------------------
     true > "${listing_file}"
 
     # Collect unique parent directories from paths_file via dirname.
-    # mirror --dry-run --verbose=3 outputs full relative paths including
-    # subdirectory prefixes (e.g. "slim/file.sql.bz2"), so dirname correctly
-    # extracts the parent directory for each file.
     true > "${dirs_file}"
     while IFS= read -r ftp_path; do
         [[ -z "${ftp_path}" ]] && continue
@@ -622,22 +671,17 @@ get_ftp_file_list() {
     while IFS= read -r dir_path; do
         [[ -z "${dir_path}" ]] && continue
 
-        # Use "ls DIR" — lftp sends LIST <dir> to the FTP server.
-        # This correctly lists directory contents when the path is passed
-        # directly (not via cd). The "cd DIR; ls" approach was incorrect
-        # as it caused ls to list an unexpected working directory.
         true > "${ls_tmp}"
         run_lftp "ls ${dir_path}" > "${ls_tmp}" 2>/dev/null || true
 
         log "DEBUG" "ls ${dir_path} — sample: $(head -10 "${ls_tmp}" | tr '\n' '|')"
 
-        # Parse each file line (starts with -)
         while IFS= read -r ls_line; do
-            [[ -z "${ls_line}" ]]      && continue
-            [[ "${ls_line}" != -* ]]   && continue
+            [[ -z "${ls_line}" ]]    && continue
+            [[ "${ls_line}" != -* ]] && continue
 
             # Parse ls columns: perms links owner group size mon day timeyr name
-            # Use IFS=' ' locally so read splits on spaces (global IFS=$'\n\t')
+            # IFS=' ' locally overrides global IFS=$'\n\t' for space-based splitting
             local size mon day timeyr name filepath epoch current_year
             IFS=' ' read -r _ _ _ _ size mon day timeyr name <<< "${ls_line}"
 
@@ -645,7 +689,6 @@ get_ftp_file_list() {
             [[ -z "${size}" ]]   && continue
             [[ -z "${timeyr}" ]] && continue
 
-            # Build full FTP path
             if [[ "${dir_path}" == "/" ]]; then
                 filepath="/${name}"
             else
@@ -690,7 +733,6 @@ get_ftp_file_list() {
         log "INFO" "FTP metadata retrieved for ${final_count} file(s)"
     fi
 
-    # Populate the work queue
     cp "${listing_file}" "${TEMP_DIR}/work_queue.txt"
 }
 
@@ -729,7 +771,6 @@ sftp_mkdir_p() {
     local batch_cmds=""
     local current=""
 
-    # Build mkdir commands for every path component
     IFS='/' read -ra parts <<< "${full_path}"
     for part in "${parts[@]}"; do
         [[ -z "${part}" ]] && continue
@@ -737,8 +778,6 @@ sftp_mkdir_p() {
         batch_cmds+="-mkdir ${current}"$'\n'
     done
 
-    # -mkdir is an sftp extension that ignores "already exists" errors
-    # If not supported, fallback to regular mkdir (errors suppressed)
     SSHPASS="${SFTP_PASS}" sshpass -e sftp \
         -P "${SFTP_PORT}" \
         -o StrictHostKeyChecking=no \
@@ -750,95 +789,90 @@ sftp_mkdir_p() {
 }
 
 # ============================================================
-# SECTION 12 — FILE TRANSFER FUNCTION
+# SECTION 12 — ATOMIC COUNTER HELPERS
 # ============================================================
+# All counter operations use flock on counters.lock so concurrent
+# workers never race on shared .cnt files.
 
-# Transfer a single file from FTP to SFTP
-# Usage: transfer_file WORKER_ID FTP_PATH FTP_SIZE FTP_MTIME_EPOCH
-# Returns: 0 on success, 1 on failure
-# Sets global-scope result via worker result file
-transfer_file() {
-    local worker_id="$1"
-    local ftp_path="$2"
-    local ftp_size="$3"
+# _counter_add FILE DELTA
+# Atomically adds DELTA (positive or negative integer) to a counter file.
+_counter_add() {
+    local file="$1"
+    local delta="$2"
+    local lock="${TEMP_DIR}/counters.lock"
+    (
+        flock -x 200
+        local current
+        current=$(cat "${file}" 2>/dev/null || echo 0)
+        local new_val=$(( current + delta ))
+        (( new_val < 0 )) && new_val=0   # clamp — counters must never go negative
+        echo "${new_val}" > "${file}"
+    ) 200>"${lock}"
+}
 
-    local basename_file
-    basename_file=$(basename "${ftp_path}")
-
-    # Build mirrored SFTP destination path
-    # FTP path is already relative to root "/"
-    local rel_path="${ftp_path}"
-    local sftp_dest_path="${SFTP_REMOTE_DIR}${rel_path}"
-    local sftp_dest_dir
-    sftp_dest_dir=$(dirname "${sftp_dest_path}")
-
-    # Staging area for this worker
-    local staging_dir="${TEMP_DIR}/staging/worker_${worker_id}"
-    mkdir -p "${staging_dir}"
-    local local_file="${staging_dir}/${basename_file}"
-
-    if [[ "${DRY_RUN}" == "true" ]]; then
-        log "INFO" "[DRY-RUN] Would transfer: ${ftp_path} → ${sftp_dest_path} (${ftp_size} bytes)"
-        return 0
-    fi
-
-    # Step 1: Download from FTP to local staging
-    log "DEBUG" "[W${worker_id}] Downloading: ${ftp_path} → ${local_file}"
-    if ! run_lftp "get ${ftp_path} -o ${local_file}" &>/dev/null; then
-        log "ERROR" "[W${worker_id}] FTP download failed: ${ftp_path}"
-        rm -f "${local_file}"
-        return 1
-    fi
-
-    # Step 2: Verify downloaded file size
-    if [[ ! -f "${local_file}" ]]; then
-        log "ERROR" "[W${worker_id}] Downloaded file not found at staging path: ${local_file}"
-        return 1
-    fi
-
-    local local_size
-    local_size=$(stat -c '%s' "${local_file}")
-    if [[ "${local_size}" != "${ftp_size}" ]]; then
-        log "ERROR" "[W${worker_id}] Download size mismatch (expected=${ftp_size}, got=${local_size}): ${ftp_path}"
-        rm -f "${local_file}"
-        return 1
-    fi
-
-    # Step 3: Ensure SFTP destination directory exists
-    log "DEBUG" "[W${worker_id}] Ensuring SFTP directory exists: ${sftp_dest_dir}"
-    sftp_mkdir_p "${sftp_dest_dir}"
-
-    # Step 4: Upload to SFTP
-    log "DEBUG" "[W${worker_id}] Uploading to SFTP: ${sftp_dest_path}"
-    if ! SSHPASS="${SFTP_PASS}" sshpass -e sftp \
-            -P "${SFTP_PORT}" \
-            -o StrictHostKeyChecking=no \
-            -o BatchMode=no \
-            -o ConnectTimeout=30 \
-            -o LogLevel=ERROR \
-            -b <(printf 'put %s %s\n' "${local_file}" "${sftp_dest_path}") \
-            "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
-        log "ERROR" "[W${worker_id}] SFTP upload failed: ${sftp_dest_path}"
-        rm -f "${local_file}"
-        return 1
-    fi
-
-    # Step 5: Verify upload by re-checking SFTP file size
-    local post_size
-    post_size=$(sftp_get_size "${sftp_dest_path}")
-    if [[ "${post_size}" != "${ftp_size}" ]]; then
-        log "ERROR" "[W${worker_id}] Upload verification failed (expected=${ftp_size}, sftp_reported=${post_size}): ${sftp_dest_path}"
-        rm -f "${local_file}"
-        return 1
-    fi
-
-    log "INFO" "[W${worker_id}] Transferred OK [${ftp_size} bytes]: ${ftp_path} → ${sftp_dest_path}"
-    rm -f "${local_file}"
-    return 0
+# _counter_get FILE — prints current value (read does not need a lock)
+_counter_get() {
+    cat "${1}" 2>/dev/null || echo 0
 }
 
 # ============================================================
-# SECTION 13 — FTP DELETION
+# SECTION 13 — DISK SPACE GUARD
+# ============================================================
+#
+# wait_for_disk_space WORKER_ID FILE_SIZE_BYTES
+#
+# Blocks until TEMP_DIR has enough free space to safely stage one more
+# download.  The usable headroom formula is:
+#
+#   usable = df_avail - in_flight_bytes - (total * DISK_SPACE_BUFFER_PCT / 100)
+#
+# Idle-exit: if no downloaders AND no uploaders are active, nothing can
+# free space — exit immediately regardless of DISK_WAIT_TIMEOUT.
+#
+# Returns 0 if space is available, 1 if it timed out or went idle.
+
+wait_for_disk_space() {
+    local worker_id="$1"
+    local file_size="$2"
+
+    local total_bytes
+    total_bytes=$(df --output=size -B1 "${TEMP_DIR}" 2>/dev/null | tail -1 | tr -d ' ')
+    local buffer_bytes=$(( total_bytes * DISK_SPACE_BUFFER_PCT / 100 ))
+
+    local waited=0
+    while true; do
+        local avail_bytes in_flight usable
+        avail_bytes=$(df --output=avail -B1 "${TEMP_DIR}" 2>/dev/null | tail -1 | tr -d ' ')
+        in_flight=$(_counter_get "${TEMP_DIR}/in_flight_bytes.cnt")
+        usable=$(( avail_bytes - in_flight - buffer_bytes ))
+
+        if (( usable >= file_size )); then
+            return 0
+        fi
+
+        # Nothing in flight that could free space — exit immediately
+        local active_dl active_ul
+        active_dl=$(_counter_get "${TEMP_DIR}/active_downloaders.cnt")
+        active_ul=$(_counter_get "${TEMP_DIR}/active_uploaders.cnt")
+
+        if (( active_dl == 0 && active_ul == 0 )); then
+            log "WARN" "[DL${worker_id}] Disk space insufficient and no active workers — skipping (need ${file_size}B, usable ${usable}B)"
+            return 1
+        fi
+
+        if (( waited >= DISK_WAIT_TIMEOUT )); then
+            log "WARN" "[DL${worker_id}] Disk space wait timed out after ${waited}s — skipping (need ${file_size}B, usable ${usable}B)"
+            return 1
+        fi
+
+        log "DEBUG" "[DL${worker_id}] Waiting for disk: need ${file_size}B, usable ${usable}B (avail=${avail_bytes}, in_flight=${in_flight}, buffer=${buffer_bytes}). Active: dl=${active_dl} ul=${active_ul}. Waited ${waited}s/${DISK_WAIT_TIMEOUT}s"
+        sleep "${DISK_WAIT_INTERVAL}"
+        (( waited += DISK_WAIT_INTERVAL )) || true
+    done
+}
+
+# ============================================================
+# SECTION 14 — FTP DELETION
 # ============================================================
 
 delete_ftp_file() {
@@ -856,147 +890,77 @@ delete_ftp_file() {
     fi
 
     if run_lftp "rm ${ftp_path}" &>/dev/null; then
-        log "INFO" "[W${worker_id}] Deleted from FTP (age ≥ ${RETENTION_DAYS}d, confirmed on SFTP): ${ftp_path}"
+        log "INFO" "[DEL${worker_id}] Deleted from FTP (age ≥ ${RETENTION_DAYS}d, confirmed on SFTP): ${ftp_path}"
         return 0
     else
-        log "ERROR" "[W${worker_id}] Failed to delete from FTP: ${ftp_path}"
+        log "ERROR" "[DEL${worker_id}] Failed to delete from FTP: ${ftp_path}"
         return 1
     fi
 }
 
 # ============================================================
-# SECTION 14 — PER-FILE PROCESSING LOGIC
+# SECTION 15 — QUEUE HELPER FUNCTIONS
 # ============================================================
 
-process_file() {
-    local worker_id="$1"
-    local ftp_size="$2"
-    local ftp_mtime="$3"
-    local ftp_path="$4"
+# _enqueue_ready LOCAL_PATH SFTP_DEST FTP_PATH FTP_SIZE FTP_MTIME
+# Appends a tab-separated entry to ready_queue atomically.
+_enqueue_ready() {
+    local local_path="$1" sftp_dest="$2" ftp_path="$3" ftp_size="$4" ftp_mtime="$5"
+    (
+        flock -x 200
+        printf '%s\t%s\t%s\t%s\t%s\n' \
+            "${local_path}" "${sftp_dest}" "${ftp_path}" "${ftp_size}" "${ftp_mtime}" \
+            >> "${TEMP_DIR}/ready_queue.txt"
+    ) 200>"${TEMP_DIR}/ready_queue.lock"
+}
 
-    local result_file="${TEMP_DIR}/workers/worker_${worker_id}.result"
+# _enqueue_confirmed FTP_PATH FTP_SIZE FTP_MTIME
+# Appends a tab-separated entry to confirmed_queue atomically.
+_enqueue_confirmed() {
+    local ftp_path="$1" ftp_size="$2" ftp_mtime="$3"
+    (
+        flock -x 200
+        printf '%s\t%s\t%s\n' "${ftp_path}" "${ftp_size}" "${ftp_mtime}" \
+            >> "${TEMP_DIR}/confirmed_queue.txt"
+    ) 200>"${TEMP_DIR}/confirmed_queue.lock"
+}
 
-    # Helper to increment worker counters
-    inc_counter() {
-        local counter="$1"
-        local current
+# _inc_result RESULT_FILE COUNTER_NAME
+# Atomically increments a named counter in a worker result file.
+_inc_result() {
+    local result_file="$1" counter="$2"
+    (
+        flock -x 200
+        local current new_val
         current=$(grep "^${counter}=" "${result_file}" 2>/dev/null | cut -d= -f2 || echo 0)
-        local new_val=$(( current + 1 ))
+        new_val=$(( current + 1 ))
         if grep -q "^${counter}=" "${result_file}" 2>/dev/null; then
             sed -i "s/^${counter}=.*/${counter}=${new_val}/" "${result_file}"
         else
             echo "${counter}=${new_val}" >> "${result_file}"
         fi
-    }
-
-    inc_counter "SCANNED"
-
-    local basename_file
-    basename_file=$(basename "${ftp_path}")
-
-    # 1. Skip dot files
-    if [[ "${basename_file}" == .* ]]; then
-        log "DEBUG" "[W${worker_id}] Skipping dot file: ${ftp_path}"
-        inc_counter "SKIPPED"
-        return 0
-    fi
-
-    # 2. Skip excluded files
-    if is_excluded "${basename_file}"; then
-        log "DEBUG" "[W${worker_id}] Skipping excluded file: ${ftp_path}"
-        inc_counter "SKIPPED"
-        return 0
-    fi
-
-    # 3. Build mirrored SFTP path
-    local sftp_dest_path="${SFTP_REMOTE_DIR}${ftp_path}"
-
-    # 4. Check current SFTP state
-    local sftp_size
-    sftp_size=$(sftp_get_size "${sftp_dest_path}")
-
-    local transfer_needed=false
-    local transfer_reason=""
-    local is_overwrite=false
-
-    if [[ "${sftp_size}" == "NOT_FOUND" ]]; then
-        transfer_needed=true
-        transfer_reason="new file (not on SFTP)"
-    elif [[ "${sftp_size}" != "${ftp_size}" ]]; then
-        if [[ "${OVERWRITE_ON_SIZE_DIFF}" == "true" ]]; then
-            transfer_needed=true
-            is_overwrite=true
-            transfer_reason="size mismatch (FTP=${ftp_size}, SFTP=${sftp_size})"
-        else
-            log "WARN" "[W${worker_id}] Size mismatch, overwrite disabled — skipping: ${ftp_path} (FTP=${ftp_size}, SFTP=${sftp_size})"
-            inc_counter "SKIPPED"
-            return 0
-        fi
-    else
-        log "DEBUG" "[W${worker_id}] Already synced with matching size — skipping: ${ftp_path}"
-        inc_counter "SKIPPED"
-        # Still fall through to retention check below
-    fi
-
-    # 5. Transfer if needed
-    local transfer_success=false
-    if [[ "${transfer_needed}" == true ]]; then
-        log "INFO" "[W${worker_id}] Transferring (${transfer_reason}): ${ftp_path}"
-        if transfer_file "${worker_id}" "${ftp_path}" "${ftp_size}" "${ftp_mtime}"; then
-            transfer_success=true
-            if [[ "${is_overwrite}" == true ]]; then
-                inc_counter "OVERWRITTEN"
-            else
-                inc_counter "TRANSFERRED"
-            fi
-        else
-            inc_counter "ERRORS"
-            # Do not attempt FTP deletion if transfer failed
-            return 0
-        fi
-    fi
-
-    # 6. FTP Retention — mtime-based age check
-    local now_epoch
-    now_epoch=$(date +%s)
-    local age_seconds=$(( now_epoch - ftp_mtime ))
-    local age_days=$(( age_seconds / 86400 ))
-
-    if (( age_days >= RETENTION_DAYS )) && [[ "${DELETE_FROM_FTP}" == "true" ]]; then
-        # Only delete if we can confirm file exists on SFTP with correct size
-        local confirmed_on_sftp=false
-
-        if [[ "${transfer_success}" == true ]]; then
-            confirmed_on_sftp=true
-        elif [[ "${transfer_needed}" == false ]] && [[ "${sftp_size}" == "${ftp_size}" ]]; then
-            # Was already synced correctly before this run
-            confirmed_on_sftp=true
-        fi
-
-        if [[ "${confirmed_on_sftp}" == true ]]; then
-            if delete_ftp_file "${ftp_path}" "${worker_id}"; then
-                inc_counter "DELETED"
-            else
-                inc_counter "ERRORS"
-            fi
-        else
-            log "WARN" "[W${worker_id}] File is ${age_days}d old but NOT confirmed on SFTP — skipping FTP deletion: ${ftp_path}"
-        fi
-    fi
+    ) 200>"${result_file}.lock"
 }
 
 # ============================================================
-# SECTION 15 — PARALLEL WORKER MODEL
+# SECTION 16 — STAGE 1: FTP DOWNLOAD WORKERS
 # ============================================================
+#
+# Each download worker:
+#   1. Pops a work_queue entry  (SIZE EPOCH FILEPATH — space-separated)
+#   2. Applies dot-file and exclusion filters
+#   3. Checks SFTP for existing file — if already synced correctly,
+#      enqueues a SKIP entry for retention check and moves on
+#   4. Calls wait_for_disk_space before reserving in-flight bytes
+#   5. Downloads to per-worker staging directory, verifies local size
+#   6. Appends a real entry to ready_queue for SFTP upload workers
 
-# Worker process — reads lines from work queue atomically and processes them
-worker_process() {
+download_worker() {
     local worker_id="$1"
-    local result_file="${TEMP_DIR}/workers/worker_${worker_id}.result"
+    local result_file="${TEMP_DIR}/workers/dl_worker_${worker_id}.result"
     local queue_file="${TEMP_DIR}/work_queue.txt"
     local lock_file="${TEMP_DIR}/work_queue.lock"
 
-    # Initialise result counters
     cat > "${result_file}" <<EOF
 SCANNED=0
 TRANSFERRED=0
@@ -1006,47 +970,384 @@ DELETED=0
 ERRORS=0
 EOF
 
-    log "DEBUG" "Worker ${worker_id} started (PID $$)"
+    _counter_add "${TEMP_DIR}/active_downloaders.cnt" 1
+    log "DEBUG" "Download worker ${worker_id} started (PID $$)"
+
+    local staging_dir="${TEMP_DIR}/staging/dl_worker_${worker_id}"
+    mkdir -p "${staging_dir}"
 
     while true; do
+        # Atomically pop the next line from the work queue
         local line=""
-
-        # Atomically read and remove the next line from the work queue
         (
             flock -x 200
-            line=$(head -1 "${queue_file}" 2>/dev/null || true)
-            if [[ -n "${line}" ]]; then
-                # Remove the first line (sed -i '1d')
+            local _line
+            _line=$(head -1 "${queue_file}" 2>/dev/null || true)
+            if [[ -n "${_line}" ]]; then
                 sed -i '1d' "${queue_file}"
             fi
-            echo "${line}"
-        ) 200>"${lock_file}" > "${TEMP_DIR}/workers/worker_${worker_id}.next_line"
+            echo "${_line}"
+        ) 200>"${lock_file}" > "${TEMP_DIR}/workers/dl_worker_${worker_id}.next_line"
 
-        line=$(cat "${TEMP_DIR}/workers/worker_${worker_id}.next_line")
+        line=$(cat "${TEMP_DIR}/workers/dl_worker_${worker_id}.next_line")
 
         if [[ -z "${line}" ]]; then
-            log "DEBUG" "Worker ${worker_id} — queue empty, exiting"
+            log "DEBUG" "Download worker ${worker_id} — queue empty, exiting"
             break
         fi
 
-        # Parse line: SIZE MTIME_EPOCH FILEPATH
+        # Parse line: SIZE MTIME_EPOCH FILEPATH  (space-separated, path may contain spaces)
         local ftp_size ftp_mtime ftp_path
-        ftp_size=$(echo "${line}" | awk '{print $1}')
+        ftp_size=$(echo  "${line}" | awk '{print $1}')
         ftp_mtime=$(echo "${line}" | awk '{print $2}')
-        ftp_path=$(echo "${line}" | awk '{for(i=3;i<=NF;i++) printf "%s%s",$i,(i==NF?"\n":" ")}')
+        ftp_path=$(echo  "${line}" | awk '{for(i=3;i<=NF;i++) printf "%s%s",$i,(i==NF?"\n":" ")}')
 
         if [[ -z "${ftp_size}" ]] || [[ -z "${ftp_mtime}" ]] || [[ -z "${ftp_path}" ]]; then
-            log "WARN" "Worker ${worker_id} — malformed queue entry, skipping: '${line}'"
+            log "WARN" "Download worker ${worker_id} — malformed queue entry, skipping: '${line}'"
             continue
         fi
 
-        process_file "${worker_id}" "${ftp_size}" "${ftp_mtime}" "${ftp_path}"
+        _inc_result "${result_file}" "SCANNED"
+
+        local basename_file
+        basename_file=$(basename "${ftp_path}")
+
+        # ---- 1. Skip dot files ----
+        if [[ "${basename_file}" == .* ]]; then
+            log "DEBUG" "[DL${worker_id}] Skipping dot file: ${ftp_path}"
+            _inc_result "${result_file}" "SKIPPED"
+            continue
+        fi
+
+        # ---- 2. Skip excluded files ----
+        if is_excluded "${basename_file}"; then
+            log "DEBUG" "[DL${worker_id}] Skipping excluded file: ${ftp_path}"
+            _inc_result "${result_file}" "SKIPPED"
+            continue
+        fi
+
+        # ---- 3. Build SFTP destination path ----
+        local sftp_dest_path="${SFTP_REMOTE_DIR}${ftp_path}"
+
+        # ---- 4. Check current SFTP state ----
+        local sftp_size
+        sftp_size=$(sftp_get_size "${sftp_dest_path}")
+
+        local transfer_needed=false transfer_reason="" is_overwrite=false
+
+        if [[ "${sftp_size}" == "NOT_FOUND" ]]; then
+            transfer_needed=true
+            transfer_reason="new file (not on SFTP)"
+        elif [[ "${sftp_size}" != "${ftp_size}" ]]; then
+            if [[ "${OVERWRITE_ON_SIZE_DIFF}" == "true" ]]; then
+                transfer_needed=true
+                is_overwrite=true
+                transfer_reason="size mismatch (FTP=${ftp_size}, SFTP=${sftp_size})"
+            else
+                log "WARN" "[DL${worker_id}] Size mismatch, overwrite disabled — skipping: ${ftp_path}"
+                _inc_result "${result_file}" "SKIPPED"
+                # Still needs retention check — enqueue as SKIP
+                _enqueue_ready "SKIP" "SKIP" "${ftp_path}" "${ftp_size}" "${ftp_mtime}"
+                continue
+            fi
+        else
+            log "DEBUG" "[DL${worker_id}] Already synced — queuing for retention check only: ${ftp_path}"
+            _inc_result "${result_file}" "SKIPPED"
+            _enqueue_ready "SKIP" "SKIP" "${ftp_path}" "${ftp_size}" "${ftp_mtime}"
+            continue
+        fi
+
+        # ---- 5. Dry-run: log intent and enqueue as DRYRUN (no actual download) ----
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            log "INFO" "[DRY-RUN] Would download: ${ftp_path} → staging (${ftp_size} bytes)"
+            _enqueue_ready "DRYRUN" "${sftp_dest_path}" "${ftp_path}" "${ftp_size}" "${ftp_mtime}"
+            if [[ "${is_overwrite}" == true ]]; then
+                _inc_result "${result_file}" "OVERWRITTEN"
+            else
+                _inc_result "${result_file}" "TRANSFERRED"
+            fi
+            continue
+        fi
+
+        # ---- 6. Wait for sufficient disk space ----
+        if ! wait_for_disk_space "${worker_id}" "${ftp_size}"; then
+            log "WARN" "[DL${worker_id}] Skipping — insufficient disk space: ${ftp_path}"
+            _inc_result "${result_file}" "ERRORS"
+            continue
+        fi
+
+        # ---- 7. Reserve in-flight bytes (committed to download) ----
+        _counter_add "${TEMP_DIR}/in_flight_bytes.cnt" "${ftp_size}"
+
+        # ---- 8. Download from FTP to local staging ----
+        local local_file="${staging_dir}/${basename_file}"
+        log "INFO" "[DL${worker_id}] Downloading (${transfer_reason}): ${ftp_path} → ${local_file}"
+
+        if ! run_lftp "get ${ftp_path} -o ${local_file}" &>/dev/null; then
+            log "ERROR" "[DL${worker_id}] FTP download failed: ${ftp_path}"
+            _counter_add "${TEMP_DIR}/in_flight_bytes.cnt" "$(( -ftp_size ))"
+            rm -f "${local_file}"
+            _inc_result "${result_file}" "ERRORS"
+            continue
+        fi
+
+        # ---- 9. Release in-flight reservation (file is now on local disk) ----
+        _counter_add "${TEMP_DIR}/in_flight_bytes.cnt" "$(( -ftp_size ))"
+
+        # ---- 10. Verify downloaded file size ----
+        if [[ ! -f "${local_file}" ]]; then
+            log "ERROR" "[DL${worker_id}] Downloaded file missing at staging: ${local_file}"
+            _inc_result "${result_file}" "ERRORS"
+            continue
+        fi
+
+        local local_size
+        local_size=$(stat -c '%s' "${local_file}")
+        if [[ "${local_size}" != "${ftp_size}" ]]; then
+            log "ERROR" "[DL${worker_id}] Size mismatch (expected=${ftp_size}, got=${local_size}): ${ftp_path}"
+            rm -f "${local_file}"
+            _inc_result "${result_file}" "ERRORS"
+            continue
+        fi
+
+        log "DEBUG" "[DL${worker_id}] Download verified (${ftp_size} bytes): ${ftp_path}"
+
+        # ---- 11. Count and enqueue for SFTP upload ----
+        if [[ "${is_overwrite}" == true ]]; then
+            _inc_result "${result_file}" "OVERWRITTEN"
+        else
+            _inc_result "${result_file}" "TRANSFERRED"
+        fi
+        _enqueue_ready "${local_file}" "${sftp_dest_path}" "${ftp_path}" "${ftp_size}" "${ftp_mtime}"
+
     done
 
-    log "DEBUG" "Worker ${worker_id} finished"
+    _counter_add "${TEMP_DIR}/active_downloaders.cnt" -1
+    log "DEBUG" "Download worker ${worker_id} finished"
 }
 
-run_parallel_workers() {
+# ============================================================
+# SECTION 17 — STAGE 2: SFTP UPLOAD WORKERS
+# ============================================================
+#
+# Each upload worker:
+#   1. Polls ready_queue for entries
+#   2. Exits when queue is empty AND all download workers are done
+#   3. SKIP entries  : retention check only (file already confirmed on SFTP)
+#   4. DRYRUN entries: logs would-upload, marks confirmed for dry-run retention log
+#   5. Real entries  : ensures SFTP dir exists, uploads file, verifies size on SFTP
+#   6. On confirmed upload: appends to confirmed_queue for Stage 3 retention check
+#   7. Deletes local staging file after confirmed upload
+
+upload_worker() {
+    local worker_id="$1"
+    local result_file="${TEMP_DIR}/workers/ul_worker_${worker_id}.result"
+    local queue_file="${TEMP_DIR}/ready_queue.txt"
+    local lock_file="${TEMP_DIR}/ready_queue.lock"
+
+    # Upload workers only track deletion errors from the retention phase;
+    # transfer counts are already recorded by download workers.
+    cat > "${result_file}" <<EOF
+SCANNED=0
+TRANSFERRED=0
+OVERWRITTEN=0
+SKIPPED=0
+DELETED=0
+ERRORS=0
+EOF
+
+    _counter_add "${TEMP_DIR}/active_uploaders.cnt" 1
+    log "DEBUG" "Upload worker ${worker_id} started (PID $$)"
+
+    while true; do
+        # Atomically pop the next entry from the ready queue
+        local line=""
+        (
+            flock -x 200
+            local _line
+            _line=$(head -1 "${queue_file}" 2>/dev/null || true)
+            if [[ -n "${_line}" ]]; then
+                sed -i '1d' "${queue_file}"
+            fi
+            echo "${_line}"
+        ) 200>"${lock_file}" > "${TEMP_DIR}/workers/ul_worker_${worker_id}.next_line"
+
+        line=$(cat "${TEMP_DIR}/workers/ul_worker_${worker_id}.next_line")
+
+        if [[ -z "${line}" ]]; then
+            # Queue is empty — only exit if all downloaders are also done
+            local active_dl
+            active_dl=$(_counter_get "${TEMP_DIR}/active_downloaders.cnt")
+            if (( active_dl == 0 )); then
+                log "DEBUG" "Upload worker ${worker_id} — queue empty and all downloaders finished, exiting"
+                break
+            fi
+            log "DEBUG" "Upload worker ${worker_id} — queue empty, waiting for downloaders (active=${active_dl})..."
+            sleep 1
+            continue
+        fi
+
+        # Parse tab-separated ready_queue entry:
+        # LOCAL_PATH \t SFTP_DEST_PATH \t FTP_PATH \t FTP_SIZE \t FTP_MTIME
+        local local_path sftp_dest_path ftp_path ftp_size ftp_mtime
+        IFS=$'\t' read -r local_path sftp_dest_path ftp_path ftp_size ftp_mtime <<< "${line}"
+
+        if [[ -z "${ftp_path}" ]] || [[ -z "${ftp_size}" ]] || [[ -z "${ftp_mtime}" ]]; then
+            log "WARN" "Upload worker ${worker_id} — malformed ready_queue entry, skipping: '${line}'"
+            continue
+        fi
+
+        local upload_confirmed=false
+
+        # ---- SKIP: already confirmed on SFTP — retention check only ----
+        if [[ "${local_path}" == "SKIP" ]]; then
+            log "DEBUG" "[UL${worker_id}] Already on SFTP — retention check only: ${ftp_path}"
+            upload_confirmed=true
+
+        # ---- DRYRUN: log intent only ----
+        elif [[ "${local_path}" == "DRYRUN" ]]; then
+            log "INFO" "[DRY-RUN] Would upload: ${ftp_path} → ${sftp_dest_path} (${ftp_size} bytes)"
+            upload_confirmed=true
+
+        # ---- Real upload ----
+        else
+            local sftp_dest_dir
+            sftp_dest_dir=$(dirname "${sftp_dest_path}")
+
+            log "DEBUG" "[UL${worker_id}] Ensuring SFTP directory: ${sftp_dest_dir}"
+            sftp_mkdir_p "${sftp_dest_dir}"
+
+            log "DEBUG" "[UL${worker_id}] Uploading: ${local_path} → ${sftp_dest_path}"
+            if ! SSHPASS="${SFTP_PASS}" sshpass -e sftp \
+                    -P "${SFTP_PORT}" \
+                    -o StrictHostKeyChecking=no \
+                    -o BatchMode=no \
+                    -o ConnectTimeout=30 \
+                    -o LogLevel=ERROR \
+                    -b <(printf 'put %s %s\n' "${local_path}" "${sftp_dest_path}") \
+                    "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
+                log "ERROR" "[UL${worker_id}] SFTP upload failed: ${sftp_dest_path}"
+                rm -f "${local_path}"
+                _inc_result "${result_file}" "ERRORS"
+                continue
+            fi
+
+            # Verify upload by re-checking size on SFTP
+            local post_size
+            post_size=$(sftp_get_size "${sftp_dest_path}")
+            if [[ "${post_size}" != "${ftp_size}" ]]; then
+                log "ERROR" "[UL${worker_id}] Upload verification failed (expected=${ftp_size}, sftp_reported=${post_size}): ${sftp_dest_path}"
+                rm -f "${local_path}"
+                _inc_result "${result_file}" "ERRORS"
+                continue
+            fi
+
+            log "INFO" "[UL${worker_id}] Upload confirmed [${ftp_size} bytes]: ${ftp_path} → ${sftp_dest_path}"
+            rm -f "${local_path}"
+            upload_confirmed=true
+        fi
+
+        # Enqueue for Stage 3 retention check if upload was confirmed
+        if [[ "${upload_confirmed}" == true ]]; then
+            _enqueue_confirmed "${ftp_path}" "${ftp_size}" "${ftp_mtime}"
+        fi
+
+    done
+
+    _counter_add "${TEMP_DIR}/active_uploaders.cnt" -1
+    log "DEBUG" "Upload worker ${worker_id} finished"
+}
+
+# ============================================================
+# SECTION 18 — STAGE 3: FTP DELETION
+# ============================================================
+#
+# Runs after all upload workers have finished.
+# Reads confirmed_queue, applies mtime-based retention policy.
+# Uses up to FTP_MAX_WORKERS parallel deletions (respects FTP connection limit).
+
+run_deletion_stage() {
+    local confirmed_queue="${TEMP_DIR}/confirmed_queue.txt"
+    local del_lock="${TEMP_DIR}/confirmed_queue.lock"
+    local result_file="${TEMP_DIR}/workers/deletion_stage.result"
+
+    cat > "${result_file}" <<EOF
+SCANNED=0
+TRANSFERRED=0
+OVERWRITTEN=0
+SKIPPED=0
+DELETED=0
+ERRORS=0
+EOF
+
+    local confirmed_count
+    confirmed_count=$(wc -l < "${confirmed_queue}")
+    log "INFO" "Deletion stage: evaluating ${confirmed_count} confirmed file(s) for FTP retention policy (≥ ${RETENTION_DAYS}d)"
+
+    if (( confirmed_count == 0 )); then
+        return 0
+    fi
+
+    local now_epoch
+    now_epoch=$(date +%s)
+
+    # Spawn up to FTP_MAX_WORKERS deletion sub-workers in parallel
+    local del_pids=()
+    for (( i=1; i<=FTP_MAX_WORKERS; i++ )); do
+        (
+            local my_id="${i}"
+            while true; do
+                local entry=""
+                (
+                    flock -x 200
+                    local _entry
+                    _entry=$(head -1 "${confirmed_queue}" 2>/dev/null || true)
+                    if [[ -n "${_entry}" ]]; then
+                        sed -i '1d' "${confirmed_queue}"
+                    fi
+                    echo "${_entry}"
+                ) 200>"${del_lock}" > "${TEMP_DIR}/workers/del_worker_${my_id}.next"
+
+                entry=$(cat "${TEMP_DIR}/workers/del_worker_${my_id}.next")
+                [[ -z "${entry}" ]] && break
+
+                # Parse: FTP_PATH \t FTP_SIZE \t FTP_MTIME
+                local ftp_path ftp_size ftp_mtime
+                IFS=$'\t' read -r ftp_path ftp_size ftp_mtime <<< "${entry}"
+
+                local age_seconds=$(( now_epoch - ftp_mtime ))
+                local age_days=$(( age_seconds / 86400 ))
+
+                if (( age_days >= RETENTION_DAYS )) && [[ "${DELETE_FROM_FTP}" == "true" ]]; then
+                    if delete_ftp_file "${ftp_path}" "${my_id}"; then
+                        _inc_result "${result_file}" "DELETED"
+                    else
+                        _inc_result "${result_file}" "ERRORS"
+                    fi
+                else
+                    if [[ "${DELETE_FROM_FTP}" != "true" ]]; then
+                        log "DEBUG" "[DEL${my_id}] FTP deletion disabled — keeping: ${ftp_path}"
+                    else
+                        log "DEBUG" "[DEL${my_id}] File is ${age_days}d old (< ${RETENTION_DAYS}d) — keeping on FTP: ${ftp_path}"
+                    fi
+                fi
+            done
+        ) &
+        del_pids+=($!)
+    done
+
+    for pid in "${del_pids[@]}"; do
+        wait "${pid}" || true
+    done
+
+    log "DEBUG" "Deletion stage complete"
+}
+
+# ============================================================
+# SECTION 19 — PIPELINE ORCHESTRATOR
+# ============================================================
+
+run_pipeline() {
     local queue_size
     queue_size=$(wc -l < "${TEMP_DIR}/work_queue.txt")
 
@@ -1055,36 +1356,59 @@ run_parallel_workers() {
         return 0
     fi
 
-    log "INFO" "Starting ${MAX_PARALLEL} parallel worker(s) to process ${queue_size} file(s)..."
+    log "INFO" "Starting pipeline: ${FTP_MAX_WORKERS} FTP download worker(s), ${SFTP_MAX_WORKERS} SFTP upload worker(s) — ${queue_size} file(s) queued"
 
     mkdir -p "${TEMP_DIR}/workers"
 
-    local worker_pids=()
-    for (( i=1; i<=MAX_PARALLEL; i++ )); do
-        worker_process "${i}" &
-        worker_pids+=($!)
-        log "DEBUG" "Spawned worker ${i} (PID ${!})"
+    # ---- Stage 1: Launch FTP download workers ----
+    local dl_pids=()
+    for (( i=1; i<=FTP_MAX_WORKERS; i++ )); do
+        download_worker "${i}" &
+        dl_pids+=($!)
+        WORKER_PIDS+=($!)
+        log "DEBUG" "Spawned download worker ${i} (PID ${!})"
     done
 
-    # Wait for all workers and capture exit codes
+    # ---- Stage 2: Launch SFTP upload workers ----
+    # Uploaders start immediately and poll ready_queue; they self-exit once
+    # the queue is drained and all downloaders are confirmed done.
+    local ul_pids=()
+    for (( i=1; i<=SFTP_MAX_WORKERS; i++ )); do
+        upload_worker "${i}" &
+        ul_pids+=($!)
+        WORKER_PIDS+=($!)
+        log "DEBUG" "Spawned upload worker ${i} (PID ${!})"
+    done
+
+    # Wait for all download workers
     local any_error=false
-    for pid in "${worker_pids[@]}"; do
+    for pid in "${dl_pids[@]}"; do
         if ! wait "${pid}"; then
-            log "ERROR" "Worker process (PID ${pid}) exited with an error"
+            log "ERROR" "Download worker (PID ${pid}) exited with an error"
             any_error=true
         fi
     done
+    [[ "${any_error}" == true ]] && log "WARN" "One or more download workers encountered errors"
 
-    if [[ "${any_error}" == true ]]; then
-        log "WARN" "One or more worker processes encountered errors (see error log)"
-    fi
+    # Wait for all upload workers
+    any_error=false
+    for pid in "${ul_pids[@]}"; do
+        if ! wait "${pid}"; then
+            log "ERROR" "Upload worker (PID ${pid}) exited with an error"
+            any_error=true
+        fi
+    done
+    [[ "${any_error}" == true ]] && log "WARN" "One or more upload workers encountered errors"
 
-    # Merge worker result files into global counters
+    # ---- Stage 3: FTP deletion (all uploads confirmed) ----
+    run_deletion_stage
+
+    # ---- Merge worker result files into global counters ----
     merge_worker_results
 }
 
 merge_worker_results() {
-    for result_file in "${TEMP_DIR}/workers"/worker_*.result; do
+    for result_file in "${TEMP_DIR}/workers"/*.result; do
         [[ -f "${result_file}" ]] || continue
         while IFS='=' read -r key value; do
             [[ -z "${key}" ]] && continue
@@ -1101,7 +1425,7 @@ merge_worker_results() {
 }
 
 # ============================================================
-# SECTION 16 — RUN SUMMARY
+# SECTION 20 — RUN SUMMARY
 # ============================================================
 
 print_summary() {
@@ -1123,21 +1447,22 @@ print_summary() {
     local summary
     summary=$(cat <<EOF
 
-╔══════════════════════════════════════════╗
+╔══════════════════════════════════════════════╗
 ║         Transfer Run Summary${dry_run_label}
-╠══════════════════════════════════════════╣
-║  Started      : ${RUN_START_TIME}
-║  Finished     : ${end_time}
-║  Duration     : ${duration_str}
-║  Workers used : ${MAX_PARALLEL}
-╠══════════════════════════════════════════╣
+╠══════════════════════════════════════════════╣
+║  Started        : ${RUN_START_TIME}
+║  Finished       : ${end_time}
+║  Duration       : ${duration_str}
+║  DL Workers     : ${FTP_MAX_WORKERS}  (FTP → staging)
+║  UL Workers     : ${SFTP_MAX_WORKERS}  (staging → SFTP)
+╠══════════════════════════════════════════════╣
 ║  Files Scanned      : ${CNT_SCANNED}
 ║  Files Transferred  : ${CNT_TRANSFERRED}
 ║  Files Overwritten  : ${CNT_OVERWRITTEN}
 ║  Files Skipped      : ${CNT_SKIPPED}
 ║  FTP Files Deleted  : ${CNT_DELETED}
 ║  Errors             : ${CNT_ERRORS}
-╚══════════════════════════════════════════╝
+╚══════════════════════════════════════════════╝
 EOF
 )
 
@@ -1152,13 +1477,36 @@ EOF
 }
 
 # ============================================================
-# SECTION 17 — SIGNAL TRAPS & CLEANUP
+# SECTION 21 — SIGNAL TRAPS & CLEANUP
 # ============================================================
 
-# Trap for unexpected exits (Ctrl+C, kill, errors)
 trap_cleanup() {
     local exit_code=$?
     log "WARN" "Script interrupted or exited unexpectedly (exit code: ${exit_code}). Cleaning up..."
+
+    # Kill all tracked worker processes before wiping staging.
+    # This prevents workers writing to paths that cleanup_temp is about to delete,
+    # and ensures SIGTERM (e.g. from "kill <pid>") propagates to workers even though
+    # SIGTERM does not automatically broadcast to the whole process group like SIGINT does.
+    if (( ${#WORKER_PIDS[@]} > 0 )); then
+        log "WARN" "Sending SIGTERM to ${#WORKER_PIDS[@]} worker process(es)..."
+        kill "${WORKER_PIDS[@]}" 2>/dev/null || true
+        # Give workers up to 5 seconds to exit cleanly before cleanup proceeds
+        local wait_tries=0
+        while (( wait_tries < 5 )); do
+            local still_running=0
+            local pid
+            for pid in "${WORKER_PIDS[@]}"; do
+                kill -0 "${pid}" 2>/dev/null && (( still_running++ )) || true
+            done
+            (( still_running == 0 )) && break
+            sleep 1
+            (( wait_tries++ )) || true
+        done
+        # Force-kill any workers that didn't exit in time
+        kill -9 "${WORKER_PIDS[@]}" 2>/dev/null || true
+    fi
+
     cleanup_temp
     release_lock
     exit "${exit_code}"
@@ -1167,7 +1515,7 @@ trap_cleanup() {
 trap trap_cleanup INT TERM EXIT
 
 # ============================================================
-# SECTION 18 — MAIN ENTRYPOINT
+# SECTION 22 — MAIN ENTRYPOINT
 # ============================================================
 
 main() {
@@ -1209,8 +1557,8 @@ main() {
     queue_size=$(wc -l < "${TEMP_DIR}/work_queue.txt")
     log "INFO" "Work queue populated: ${queue_size} file(s) to evaluate"
 
-    # 10. Run parallel workers
-    run_parallel_workers
+    # 10. Run decoupled download/upload pipeline
+    run_pipeline
 
     # 11. Rotate old general logs
     rotate_logs
@@ -1219,7 +1567,6 @@ main() {
     cleanup_temp
 
     # 13. Release PID lock
-    # (trap will also call this on exit, but explicit call is fine — release_lock is idempotent)
     release_lock
 
     # Remove the trap now that we're doing a clean exit
@@ -1232,4 +1579,5 @@ main() {
 # ============================================================
 # ENTRYPOINT
 # ============================================================
+
 main "$@"
