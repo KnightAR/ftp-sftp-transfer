@@ -20,6 +20,8 @@
 #   -f N      Override FTP download workers (this run only)
 #   -s N      Override SFTP upload workers  (this run only)
 #   -v        Verbose / DEBUG to stdout     (this run only)
+#   -V        Verify mode: re-download all FTP files, checksum-verify
+#             every SFTP copy, then run retention deletions
 #   -h        Show this help message
 #
 # ============================================================
@@ -35,7 +37,7 @@ SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_NAME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 
 # Default config path (overridden by -c flag)
 DEFAULT_CONFIG="${SCRIPT_DIR}/transfer.conf"
@@ -78,6 +80,7 @@ CLI_DELETE_FROM_FTP=""
 CLI_FTP_WORKERS=""
 CLI_SFTP_WORKERS=""
 CLI_VERBOSE=false
+CLI_VERIFY_MODE=false   # -V / --verify: re-download all, checksum-verify, then delete
 
 usage() {
     cat <<EOF
@@ -94,6 +97,10 @@ Options:
   -f N      Override FTP download workers     (this run only)
   -s N      Override SFTP upload workers      (this run only)
   -v        Verbose output (DEBUG level)      (stdout + log)
+  -V        Verify mode: re-download every FTP file regardless of SFTP
+            state, checksum-verify the SFTP copy, then run retention
+            deletions.  Use after a bulk upload to confirm all files
+            before FTP deletion begins.
   -h        Show this help message
 
 Examples:
@@ -103,12 +110,14 @@ Examples:
   ${SCRIPT_NAME} -c /etc/transfer.conf        # Use alternate config file
   ${SCRIPT_NAME} -n -f 1                      # No FTP deletion, single download worker
   ${SCRIPT_NAME} -f 2 -s 10                   # 2 FTP downloaders, 10 SFTP uploaders
+  ${SCRIPT_NAME} -V                           # Re-confirm all SFTP files via checksum
+  ${SCRIPT_NAME} -V -n                        # Re-confirm without deleting from FTP
 EOF
     exit 0
 }
 
 parse_args() {
-    while getopts ":c:e:t:f:s:dnvh" opt; do
+    while getopts ":c:e:t:f:s:dnvVh" opt; do
         case "${opt}" in
             c) CLI_CONFIG="${OPTARG}" ;;
             e) CLI_EXCLUDE_LIST="${OPTARG}" ;;
@@ -118,6 +127,7 @@ parse_args() {
             d) CLI_DRY_RUN="true" ;;
             n) CLI_DELETE_FROM_FTP="false" ;;
             v) CLI_VERBOSE=true ;;
+            V) CLI_VERIFY_MODE=true ;;
             h) usage ;;
             :) echo "ERROR: Option -${OPTARG} requires an argument." >&2; exit 1 ;;
             \?) echo "ERROR: Unknown option -${OPTARG}." >&2; exit 1 ;;
@@ -156,6 +166,8 @@ load_config() {
     [[ -n "${CLI_DELETE_FROM_FTP}" ]] && DELETE_FROM_FTP="${CLI_DELETE_FROM_FTP}"
     [[ -n "${CLI_FTP_WORKERS}" ]]     && FTP_MAX_WORKERS="${CLI_FTP_WORKERS}"
     [[ -n "${CLI_SFTP_WORKERS}" ]]    && SFTP_MAX_WORKERS="${CLI_SFTP_WORKERS}"
+    # -V flag always wins — once set on the CLI it cannot be overridden by config
+    [[ "${CLI_VERIFY_MODE}" == true ]] && VERIFY_MODE="true"
 
     # Apply defaults for optional variables not set in the config file.
     # Credentials and host/path values have no safe defaults and are
@@ -173,6 +185,14 @@ load_config() {
     : "${OVERWRITE_ON_SIZE_DIFF:=true}"
     : "${EXCLUDE_LIST:=}"
     : "${TEMP_DIR:=}"
+    # VERIFY_CHECKSUM: re-download the uploaded file from SFTP and compare sha256
+    # against the local staged copy before deleting staging.  Defaults to true
+    # because this is an intranet/uncapped connection — bandwidth is not a concern.
+    : "${VERIFY_CHECKSUM:=true}"
+    # VERIFY_MODE: set to true (or use -V) to re-download every FTP file even if
+    # it already exists on SFTP, re-verify checksums, then run retention deletions.
+    # Intended as a one-time bulk re-confirmation run after a prior upload session.
+    : "${VERIFY_MODE:=false}"
 
     validate_config
 }
@@ -519,6 +539,8 @@ cleanup_temp() {
             rm -f  "${TEMP_DIR}/ul_idle_last_print.ts"
             rm -f  "${TEMP_DIR}/ul_idle_report.lock"
             rm -f  "${TEMP_DIR}/ftp_listing.txt"
+            # Remove any leftover .verify temp files from checksum verification
+            find "${TEMP_DIR}" -maxdepth 4 -name "*.verify" -delete 2>/dev/null || true
             log "DEBUG" "Cleaned contents of custom temp directory: ${TEMP_DIR}"
         fi
     fi
@@ -773,7 +795,8 @@ sftp_get_size() {
         -o LogLevel=ERROR \
         -b <(printf 'ls -l %s\n' "${remote_path}") \
         "${SFTP_USER}@${SFTP_HOST}" 2>/dev/null \
-        | awk -v name="${remote_basename}" 'NF>=9 && /^[-]/ && $NF==name {print $5}' \
+        | awk -v name="${remote_basename}" \
+            'NF>=9 && /^[-]/ && ($NF==name || substr($NF,length($NF)-length(name),1)=="/" && substr($NF,length($NF)-length(name)+1)==name) {print $5}' \
         | head -1)
 
     if [[ -z "${result}" ]]; then
@@ -805,6 +828,72 @@ sftp_mkdir_p() {
         -o LogLevel=ERROR \
         -b <(printf '%s' "${batch_cmds}") \
         "${SFTP_USER}@${SFTP_HOST}" &>/dev/null || true
+}
+
+# sftp_download_verify LOCAL_STAGED_FILE SFTP_REMOTE_PATH WORKER_TAG
+#
+# Re-downloads SFTP_REMOTE_PATH to a temporary .verify file next to
+# LOCAL_STAGED_FILE, computes sha256sum of both, and compares them.
+#
+# Returns:
+#   0  — checksums match (SFTP copy is byte-identical to local staged file)
+#   1  — checksum mismatch or download/hash failure
+#
+# The .verify temp file is always removed before returning, even on error.
+#
+# Design notes:
+#   - Uses process-substitution batch mode (same pattern as sftp_get_size)
+#     so no temp batch-command file is needed.
+#   - The "get REMOTE LOCAL" sftp batch command writes the downloaded file
+#     to the local path; sftp exits non-zero on transfer failure.
+#   - sha256sum output format: "<hash>  <filename>" — only the hash field
+#     is compared so the filename mismatch between .verify and staged is fine.
+sftp_download_verify() {
+    local local_staged="$1"
+    local remote_path="$2"
+    local worker_tag="${3:-UL?}"
+
+    local verify_file="${local_staged}.verify"
+
+    # Always clean up the temp verify file, even on early return
+    # shellcheck disable=SC2064
+    trap "rm -f '${verify_file}'" RETURN
+
+    # Re-download the remote file to a local .verify temp file
+    if ! SSHPASS="${SFTP_PASS}" sshpass -e sftp \
+            -P "${SFTP_PORT}" \
+            -o StrictHostKeyChecking=no \
+            -o BatchMode=no \
+            -o ConnectTimeout=30 \
+            -o LogLevel=ERROR \
+            -b <(printf 'get %s %s\n' "${remote_path}" "${verify_file}") \
+            "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
+        log "ERROR" "[${worker_tag}] Checksum verify: failed to re-download from SFTP: ${remote_path}"
+        return 1
+    fi
+
+    if [[ ! -f "${verify_file}" ]]; then
+        log "ERROR" "[${worker_tag}] Checksum verify: re-download produced no local file: ${verify_file}"
+        return 1
+    fi
+
+    # Compute sha256 for both files; sha256sum output: "<hash>  <path>"
+    local hash_staged hash_sftp
+    hash_staged=$(sha256sum "${local_staged}" 2>/dev/null | awk '{print $1}')
+    hash_sftp=$(sha256sum   "${verify_file}"  2>/dev/null | awk '{print $1}')
+
+    if [[ -z "${hash_staged}" ]] || [[ -z "${hash_sftp}" ]]; then
+        log "ERROR" "[${worker_tag}] Checksum verify: sha256sum failed (staged='${hash_staged}' sftp='${hash_sftp}'): ${remote_path}"
+        return 1
+    fi
+
+    if [[ "${hash_staged}" != "${hash_sftp}" ]]; then
+        log "ERROR" "[${worker_tag}] Checksum MISMATCH (staged=${hash_staged}, sftp=${hash_sftp}): ${remote_path}"
+        return 1
+    fi
+
+    log "DEBUG" "[${worker_tag}] Checksum OK (sha256=${hash_staged}): ${remote_path}"
+    return 0
 }
 
 # ============================================================
@@ -1072,31 +1161,46 @@ EOF
         local sftp_dest_path="${SFTP_REMOTE_DIR}${ftp_path}"
 
         # ---- 4. Check current SFTP state ----
-        local sftp_size
-        sftp_size=$(sftp_get_size "${sftp_dest_path}")
-
+        # In VERIFY_MODE every file must be re-downloaded from FTP so the upload
+        # worker can re-confirm the SFTP copy via checksum — skip this block.
         local transfer_needed=false transfer_reason="" is_overwrite=false
 
-        if [[ "${sftp_size}" == "NOT_FOUND" ]]; then
+        if [[ "${VERIFY_MODE}" == "true" ]]; then
+            # Force transfer regardless of what is already on SFTP
             transfer_needed=true
-            transfer_reason="new file (not on SFTP)"
-        elif [[ "${sftp_size}" != "${ftp_size}" ]]; then
-            if [[ "${OVERWRITE_ON_SIZE_DIFF}" == "true" ]]; then
-                transfer_needed=true
-                is_overwrite=true
-                transfer_reason="size mismatch (FTP=${ftp_size}, SFTP=${sftp_size})"
+            local sftp_size_vm
+            sftp_size_vm=$(sftp_get_size "${sftp_dest_path}")
+            if [[ "${sftp_size_vm}" == "NOT_FOUND" ]]; then
+                transfer_reason="verify-mode: new file (not on SFTP)"
             else
-                log "WARN" "[DL${worker_id}] Size mismatch, overwrite disabled — skipping: ${ftp_path}"
+                is_overwrite=true
+                transfer_reason="verify-mode: re-downloading for checksum verification (SFTP size=${sftp_size_vm})"
+            fi
+        else
+            local sftp_size
+            sftp_size=$(sftp_get_size "${sftp_dest_path}")
+
+            if [[ "${sftp_size}" == "NOT_FOUND" ]]; then
+                transfer_needed=true
+                transfer_reason="new file (not on SFTP)"
+            elif [[ "${sftp_size}" != "${ftp_size}" ]]; then
+                if [[ "${OVERWRITE_ON_SIZE_DIFF}" == "true" ]]; then
+                    transfer_needed=true
+                    is_overwrite=true
+                    transfer_reason="size mismatch (FTP=${ftp_size}, SFTP=${sftp_size})"
+                else
+                    log "WARN" "[DL${worker_id}] Size mismatch, overwrite disabled — skipping: ${ftp_path}"
+                    _inc_result "${result_file}" "SKIPPED"
+                    # Still needs retention check — enqueue as SKIP
+                    _enqueue_ready "SKIP" "SKIP" "${ftp_path}" "${ftp_size}" "${ftp_mtime}"
+                    continue
+                fi
+            else
+                log "DEBUG" "[DL${worker_id}] Already synced — queuing for retention check only: ${ftp_path}"
                 _inc_result "${result_file}" "SKIPPED"
-                # Still needs retention check — enqueue as SKIP
                 _enqueue_ready "SKIP" "SKIP" "${ftp_path}" "${ftp_size}" "${ftp_mtime}"
                 continue
             fi
-        else
-            log "DEBUG" "[DL${worker_id}] Already synced — queuing for retention check only: ${ftp_path}"
-            _inc_result "${result_file}" "SKIPPED"
-            _enqueue_ready "SKIP" "SKIP" "${ftp_path}" "${ftp_size}" "${ftp_mtime}"
-            continue
         fi
 
         # ---- 5. Dry-run: log intent and enqueue as DRYRUN (no actual download) ----
@@ -1263,7 +1367,14 @@ EOF
 
         # ---- SKIP: already confirmed on SFTP — retention check only ----
         if [[ "${local_path}" == "SKIP" ]]; then
-            log "DEBUG" "[UL${worker_id}] Already on SFTP — retention check only: ${ftp_path}"
+            # In VERIFY_MODE download_worker forces re-download of every file,
+            # so SKIP entries should not appear.  If one does (edge case), log it
+            # so the operator knows this file was not re-verified via checksum.
+            if [[ "${VERIFY_MODE}" == "true" ]]; then
+                log "WARN" "[UL${worker_id}] VERIFY_MODE: unexpected SKIP entry — file not re-verified: ${ftp_path}"
+            else
+                log "DEBUG" "[UL${worker_id}] Already on SFTP — retention check only: ${ftp_path}"
+            fi
             upload_confirmed=true
 
         # ---- DRYRUN: log intent only ----
@@ -1276,37 +1387,88 @@ EOF
             local sftp_dest_dir
             sftp_dest_dir=$(dirname "${sftp_dest_path}")
 
-            log "DEBUG" "[UL${worker_id}] Ensuring SFTP directory: ${sftp_dest_dir}"
-            sftp_mkdir_p "${sftp_dest_dir}"
+            if [[ "${VERIFY_MODE}" == "true" ]]; then
+                # ---- VERIFY_MODE: skip re-uploading, verify the existing SFTP copy ----
+                # download_worker already re-downloaded the file from FTP to staging so
+                # we have a fresh local copy to checksum against.  We must NOT re-upload
+                # because the file is expected to already be correct on SFTP — the whole
+                # point of verify mode is to confirm the existing copy without overwriting.
+                log "INFO" "[UL${worker_id}] [VERIFY] Skipping upload — verifying existing SFTP copy: ${sftp_dest_path}"
 
-            log "DEBUG" "[UL${worker_id}] Uploading: ${local_path} → ${sftp_dest_path}"
-            if ! SSHPASS="${SFTP_PASS}" sshpass -e sftp \
-                    -P "${SFTP_PORT}" \
-                    -o StrictHostKeyChecking=no \
-                    -o BatchMode=no \
-                    -o ConnectTimeout=30 \
-                    -o LogLevel=ERROR \
-                    -b <(printf 'put %s %s\n' "${local_path}" "${sftp_dest_path}") \
-                    "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
-                log "ERROR" "[UL${worker_id}] SFTP upload failed: ${sftp_dest_path}"
+                # Size check first — if NOT_FOUND the file is genuinely missing on SFTP
+                local verify_size
+                verify_size=$(sftp_get_size "${sftp_dest_path}")
+                if [[ "${verify_size}" == "NOT_FOUND" ]]; then
+                    log "ERROR" "[UL${worker_id}] [VERIFY] File not found on SFTP — was never uploaded: ${sftp_dest_path}"
+                    rm -f "${local_path}"
+                    _inc_result "${result_file}" "ERRORS"
+                    continue
+                fi
+                if [[ "${verify_size}" != "${ftp_size}" ]]; then
+                    log "ERROR" "[UL${worker_id}] [VERIFY] Size mismatch on SFTP (expected=${ftp_size}, sftp_reported=${verify_size}): ${sftp_dest_path}"
+                    rm -f "${local_path}"
+                    _inc_result "${result_file}" "ERRORS"
+                    continue
+                fi
+
+                # Checksum: re-download SFTP copy and compare against FTP-fresh staged file
+                if ! sftp_download_verify "${local_path}" "${sftp_dest_path}" "UL${worker_id}"; then
+                    log "ERROR" "[UL${worker_id}] [VERIFY] Checksum FAILED — SFTP copy does not match FTP source: ${sftp_dest_path}"
+                    rm -f "${local_path}"
+                    _inc_result "${result_file}" "ERRORS"
+                    continue
+                fi
+
+                log "INFO" "[UL${worker_id}] [VERIFY] Verified OK [${ftp_size} bytes, checksum OK]: ${ftp_path} → ${sftp_dest_path}"
                 rm -f "${local_path}"
-                _inc_result "${result_file}" "ERRORS"
-                continue
-            fi
+                upload_confirmed=true
 
-            # Verify upload by re-checking size on SFTP
-            local post_size
-            post_size=$(sftp_get_size "${sftp_dest_path}")
-            if [[ "${post_size}" != "${ftp_size}" ]]; then
-                log "ERROR" "[UL${worker_id}] Upload verification failed (expected=${ftp_size}, sftp_reported=${post_size}): ${sftp_dest_path}"
+            else
+                # ---- Normal mode: upload → size verify → checksum verify ----
+                log "DEBUG" "[UL${worker_id}] Ensuring SFTP directory: ${sftp_dest_dir}"
+                sftp_mkdir_p "${sftp_dest_dir}"
+
+                log "DEBUG" "[UL${worker_id}] Uploading: ${local_path} → ${sftp_dest_path}"
+                if ! SSHPASS="${SFTP_PASS}" sshpass -e sftp \
+                        -P "${SFTP_PORT}" \
+                        -o StrictHostKeyChecking=no \
+                        -o BatchMode=no \
+                        -o ConnectTimeout=30 \
+                        -o LogLevel=ERROR \
+                        -b <(printf 'put %s %s\n' "${local_path}" "${sftp_dest_path}") \
+                        "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
+                    log "ERROR" "[UL${worker_id}] SFTP upload failed: ${sftp_dest_path}"
+                    rm -f "${local_path}"
+                    _inc_result "${result_file}" "ERRORS"
+                    continue
+                fi
+
+                # Verify upload by re-checking size on SFTP
+                local post_size
+                post_size=$(sftp_get_size "${sftp_dest_path}")
+                if [[ "${post_size}" != "${ftp_size}" ]]; then
+                    log "ERROR" "[UL${worker_id}] Upload size verification failed (expected=${ftp_size}, sftp_reported=${post_size}): ${sftp_dest_path}"
+                    rm -f "${local_path}"
+                    _inc_result "${result_file}" "ERRORS"
+                    continue
+                fi
+
+                # Checksum verification — re-download the SFTP copy and compare sha256
+                # against the local staged file.  Always enabled on this intranet/uncapped
+                # connection; controlled by VERIFY_CHECKSUM in the config.
+                if [[ "${VERIFY_CHECKSUM}" == "true" ]]; then
+                    if ! sftp_download_verify "${local_path}" "${sftp_dest_path}" "UL${worker_id}"; then
+                        log "ERROR" "[UL${worker_id}] Checksum verification failed — upload may be corrupt: ${sftp_dest_path}"
+                        rm -f "${local_path}"
+                        _inc_result "${result_file}" "ERRORS"
+                        continue
+                    fi
+                fi
+
+                log "INFO" "[UL${worker_id}] Upload confirmed [${ftp_size} bytes, checksum OK]: ${ftp_path} → ${sftp_dest_path}"
                 rm -f "${local_path}"
-                _inc_result "${result_file}" "ERRORS"
-                continue
+                upload_confirmed=true
             fi
-
-            log "INFO" "[UL${worker_id}] Upload confirmed [${ftp_size} bytes]: ${ftp_path} → ${sftp_dest_path}"
-            rm -f "${local_path}"
-            upload_confirmed=true
         fi
 
         # Enqueue for Stage 3 retention check if upload was confirmed
@@ -1594,7 +1756,9 @@ main() {
     setup_logging
 
     log "INFO" "=== ${SCRIPT_NAME} v${SCRIPT_VERSION} — Transfer run started (PID $$) ==="
-    [[ "${DRY_RUN}" == "true" ]] && log "INFO" "*** DRY-RUN MODE ENABLED — No files will be moved or deleted ***"
+    [[ "${DRY_RUN}"        == "true" ]] && log "INFO" "*** DRY-RUN MODE ENABLED — No files will be moved or deleted ***"
+    [[ "${VERIFY_MODE}"    == "true" ]] && log "INFO" "*** VERIFY MODE ENABLED — All FTP files will be re-downloaded and SFTP copies checksum-verified ***"
+    [[ "${VERIFY_CHECKSUM}" == "true" ]] && [[ "${VERIFY_MODE}" != "true" ]] && log "INFO" "Checksum verification enabled (VERIFY_CHECKSUM=true) — SFTP uploads will be re-downloaded and sha256-verified"
 
     # 4. Check required dependencies (with interactive install prompt)
     check_dependencies
