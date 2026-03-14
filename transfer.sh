@@ -816,10 +816,15 @@ sftp_get_size() {
         | head -1)
 
     # In verbose mode: emit one single atomic log entry containing the query,
-    # every raw ls line, and the matched result — keeping it as one log() call
-    # so it is written under one flock and never interleaved with other workers.
+    # every raw ls line, and the matched result.
+    # IMPORTANT: this function is always called inside $(...) by callers that
+    # capture its return value via stdout.  log() writes to stdout, which means
+    # any log() call here would be captured into the caller's variable instead
+    # of being printed.  We therefore write directly to the log files and stderr
+    # (bypassing stdout entirely) using the same flock pattern as log().
     if [[ "${CLI_VERBOSE}" == true ]]; then
-        local dbg_msg="sftp_get_size: path=${remote_path} basename=${remote_basename} result='${result:-NOT_FOUND}'"
+        local dbg_msg
+        dbg_msg="sftp_get_size: path=${remote_path} basename=${remote_basename} result='${result:-NOT_FOUND}'"
         if [[ -z "${raw_ls}" ]]; then
             dbg_msg+=" | raw=<empty>"
         else
@@ -828,7 +833,12 @@ sftp_get_size() {
                 dbg_msg+=" | ${raw_line}"
             done <<< "${raw_ls}"
         fi
-        log "DEBUG" "${dbg_msg}"
+        local dbg_line="[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG]  ${dbg_msg}"
+        (
+            flock -x 200
+            echo "${dbg_line}" >> "${LOG_FILE}"
+            echo "${dbg_line}" >&2
+        ) 200>"${LOG_FILE}.lock"
     fi
 
     if [[ -z "${result}" ]]; then
@@ -865,7 +875,14 @@ sftp_get_size_retry() {
             return 0
         fi
         if (( attempt < max_tries )); then
-            log "DEBUG" "sftp_get_size_retry: attempt ${attempt}/${max_tries} got '${size}', expected '${expected_size}' — retrying in ${sleep_secs}s (${remote_path})"
+            # Write directly to log file + stderr — same reason as sftp_get_size:
+            # this function is called inside $(...) so log() stdout would be captured.
+            local retry_line="[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG]  sftp_get_size_retry: attempt ${attempt}/${max_tries} got '${size}', expected '${expected_size}' — retrying in ${sleep_secs}s (${remote_path})"
+            (
+                flock -x 200
+                echo "${retry_line}" >> "${LOG_FILE}"
+                [[ "${CLI_VERBOSE}" == true ]] && echo "${retry_line}" >&2
+            ) 200>"${LOG_FILE}.lock"
             sleep "${sleep_secs}"
         fi
         (( attempt++ )) || true
