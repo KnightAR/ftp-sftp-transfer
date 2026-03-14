@@ -489,6 +489,14 @@ setup_temp_dir() {
     echo "0" > "${TEMP_DIR}/active_downloaders.cnt"
     echo "0" > "${TEMP_DIR}/active_uploaders.cnt"
     touch "${TEMP_DIR}/counters.lock"
+
+    # ---- Upload worker idle reporting state ----
+    # idle_uploaders.cnt   : workers currently in the empty-queue wait loop
+    # ul_idle_last_print.ts : epoch of the last printed idle summary line
+    # ul_idle_report.lock  : ensures only one worker evaluates/prints at a time
+    echo "0" > "${TEMP_DIR}/idle_uploaders.cnt"
+    echo "0" > "${TEMP_DIR}/ul_idle_last_print.ts"
+    touch "${TEMP_DIR}/ul_idle_report.lock"
 }
 
 cleanup_temp() {
@@ -507,6 +515,9 @@ cleanup_temp() {
             rm -f  "${TEMP_DIR}/active_downloaders.cnt"
             rm -f  "${TEMP_DIR}/active_uploaders.cnt"
             rm -f  "${TEMP_DIR}/counters.lock"
+            rm -f  "${TEMP_DIR}/idle_uploaders.cnt"
+            rm -f  "${TEMP_DIR}/ul_idle_last_print.ts"
+            rm -f  "${TEMP_DIR}/ul_idle_report.lock"
             rm -f  "${TEMP_DIR}/ftp_listing.txt"
             log "DEBUG" "Cleaned contents of custom temp directory: ${TEMP_DIR}"
         fi
@@ -746,6 +757,14 @@ sftp_get_size() {
     local remote_path="$1"
     local result
 
+    # Use "ls -l <path>" and anchor the awk match to the exact basename of the
+    # remote path. Without this anchor, some SFTP servers respond to "ls -l
+    # /dir/file" by listing the parent directory — causing awk to pick up the
+    # first file line regardless of name, which returns the wrong size when two
+    # files in different subdirectories share the same basename.
+    local remote_basename
+    remote_basename=$(basename "${remote_path}")
+
     result=$(SSHPASS="${SFTP_PASS}" sshpass -e sftp \
         -P "${SFTP_PORT}" \
         -o StrictHostKeyChecking=no \
@@ -754,7 +773,7 @@ sftp_get_size() {
         -o LogLevel=ERROR \
         -b <(printf 'ls -l %s\n' "${remote_path}") \
         "${SFTP_USER}@${SFTP_HOST}" 2>/dev/null \
-        | awk 'NF>=9 && /^[-]/ {print $5}' \
+        | awk -v name="${remote_basename}" 'NF>=9 && /^[-]/ && $NF==name {print $5}' \
         | head -1)
 
     if [[ -z "${result}" ]]; then
@@ -942,6 +961,29 @@ _inc_result() {
     ) 200>"${result_file}.lock"
 }
 
+# _ul_report_idle IDLE_COUNT TOTAL_WORKERS
+# Prints an aggregated "Upload Workers: X/Y idle" summary line at most once
+# per DISK_WAIT_INTERVAL seconds across all upload workers combined.
+# Time-only gate — no change-trigger — prevents flickering when the idle count
+# oscillates by 1 as workers briefly deregister to retry the queue each second.
+# Uses flock so only one worker evaluates and prints at a time.
+_ul_report_idle() {
+    local idle_count="$1"
+    local total_workers="$2"
+    (
+        flock -x 200
+        local last_print now elapsed
+        last_print=$(cat "${TEMP_DIR}/ul_idle_last_print.ts" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        elapsed=$(( now - last_print ))
+
+        if (( elapsed >= DISK_WAIT_INTERVAL )); then
+            log "DEBUG" "Upload Workers: ${idle_count}/${total_workers} thread(s) idle, waiting for downloads"
+            echo "${now}" > "${TEMP_DIR}/ul_idle_last_print.ts"
+        fi
+    ) 200>"${TEMP_DIR}/ul_idle_report.lock"
+}
+
 # ============================================================
 # SECTION 16 — STAGE 1: FTP DOWNLOAD WORKERS
 # ============================================================
@@ -1080,7 +1122,19 @@ EOF
         _counter_add "${TEMP_DIR}/in_flight_bytes.cnt" "${ftp_size}"
 
         # ---- 8. Download from FTP to local staging ----
-        local local_file="${staging_dir}/${basename_file}"
+        # Preserve the FTP directory structure under the worker staging dir so that
+        # identically-named files in different FTP subdirectories (e.g. /file.bz2 and
+        # /slim/file.bz2) never collide at the same local path.
+        local ftp_dir local_subdir local_file
+        ftp_dir=$(dirname "${ftp_path}")
+        # Avoid double-slash for root files: dirname("/file") = "/" so subdir = staging_dir
+        if [[ "${ftp_dir}" == "/" ]]; then
+            local_subdir="${staging_dir}"
+        else
+            local_subdir="${staging_dir}${ftp_dir}"
+        fi
+        mkdir -p "${local_subdir}"
+        local_file="${local_subdir}/${basename_file}"
         log "INFO" "[DL${worker_id}] Downloading (${transfer_reason}): ${ftp_path} → ${local_file}"
 
         if ! run_lftp "get ${ftp_path} -o ${local_file}" &>/dev/null; then
@@ -1182,12 +1236,16 @@ EOF
                 log "DEBUG" "Upload worker ${worker_id} — queue empty and all downloaders finished, exiting"
                 break
             fi
-            # Suppress polling noise in dry-run — downloads finish near-instantly
-            # and flooding verbose output with wait messages adds no value
-            if [[ "${DRY_RUN}" != "true" ]]; then
-                log "DEBUG" "Upload worker ${worker_id} — queue empty, waiting for downloaders (active=${active_dl})..."
-            fi
+            # Register as idle, print aggregated summary (rate-limited), then wait.
+            # idle_uploaders.cnt tracks workers genuinely waiting — distinct from
+            # active_uploaders.cnt which counts all workers alive regardless of state.
+            _counter_add "${TEMP_DIR}/idle_uploaders.cnt" 1
+            local idle_count
+            idle_count=$(_counter_get "${TEMP_DIR}/idle_uploaders.cnt")
+            _ul_report_idle "${idle_count}" "${SFTP_MAX_WORKERS}"
             sleep 1
+            # Deregister idle before looping back to try the queue again
+            _counter_add "${TEMP_DIR}/idle_uploaders.cnt" -1
             continue
         fi
 
