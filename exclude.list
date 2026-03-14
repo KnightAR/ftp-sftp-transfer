@@ -1,0 +1,45 @@
+# ============================================================
+# exclude.list — File Exclusion Patterns for transfer.sh
+#
+# One pattern per line. Blank lines and lines starting with
+# '#' are ignored. Inline comments (after a value) are also
+# stripped before matching.
+#
+# Matching is performed against the BASENAME of each file
+# (not the full path). Matching is case-sensitive.
+#
+# Supported pattern formats:
+#   *.ext         — match by file extension
+#                   e.g. *.tmp  matches  dump.sql.gz.tmp
+#   filename.ext  — exact filename match
+#                   e.g. debug.log  matches  debug.log only
+#   prefix_*      — wildcard prefix match
+#                   e.g. backup_*  matches  backup_2024.tar.gz
+#   *substring*   — substring match
+#                   e.g. *partial*  matches  db_partial_restore.sql
+#   *             — matches any character(s) including dots
+#   ?             — matches any single character
+#
+# Examples (uncomment to activate):
+# ============================================================
+
+# --- Incomplete / temporary transfer files ---
+*.tmp
+*.partial
+*.crdownload
+*.part
+
+# --- Editor and system lock files ---
+*.swp
+*.swo
+*.lck
+*.lock
+
+# --- Specific filenames to never transfer ---
+# DONOTTRANSFER.sql
+# debug.log
+# error.log
+
+# --- Archive staging patterns ---
+# *_staging.*
+# *_wip.*
