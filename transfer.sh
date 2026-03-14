@@ -56,6 +56,13 @@ FTP_CONNECT_STR=""       # Assembled lftp connection string
 # so that Ctrl+C / SIGTERM kills workers before staging is deleted
 WORKER_PIDS=()
 
+# Persistent re-upload flag file — survives across runs.
+# Any FTP path written here is force-reuploaded on the next run regardless
+# of whether the file already exists on SFTP.  Entries are written on
+# checksum failure and cleared after a verified-clean successful upload.
+# Path defaults to SCRIPT_DIR; can be overridden in config via REUPLOAD_LOG.
+REUPLOAD_LOG="${SCRIPT_DIR}/reupload.log"
+
 # Counters (updated by workers via temp files, merged at end)
 CNT_SCANNED=0
 CNT_TRANSFERRED=0
@@ -193,6 +200,10 @@ load_config() {
     # it already exists on SFTP, re-verify checksums, then run retention deletions.
     # Intended as a one-time bulk re-confirmation run after a prior upload session.
     : "${VERIFY_MODE:=false}"
+    # REUPLOAD_LOG: persistent file listing FTP paths that must be force-reuploaded
+    # on the next run due to a previous checksum failure.  Survives temp dir
+    # cleanup.  Default is alongside the script; override in config if needed.
+    : "${REUPLOAD_LOG:=${SCRIPT_DIR}/reupload.log}"
 
     validate_config
 }
@@ -981,6 +992,76 @@ sftp_download_verify() {
     return 0
 }
 
+# sftp_delete_file REMOTE_PATH WORKER_TAG
+#
+# Deletes a single file from the SFTP server.  Used to remove a corrupt
+# upload so the next run treats it as NOT_FOUND and re-uploads from FTP.
+#
+# Returns 0 on success, 1 on failure (logged but not fatal — the caller
+# must still mark the file as an error and skip _enqueue_confirmed so the
+# FTP source is never deleted for a file with an unverified SFTP copy).
+sftp_delete_file() {
+    local remote_path="$1"
+    local worker_tag="${2:-UL?}"
+
+    if SSHPASS="${SFTP_PASS}" sshpass -e sftp             -P "${SFTP_PORT}"             -o StrictHostKeyChecking=no             -o BatchMode=no             -o ConnectTimeout=15             -o LogLevel=ERROR             -b <(printf 'rm %s
+' "${remote_path}")             "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
+        log "WARN" "[${worker_tag}] Deleted corrupt SFTP file to force re-upload on next run: ${remote_path}"
+        return 0
+    else
+        log "ERROR" "[${worker_tag}] Failed to delete corrupt SFTP file — manual intervention may be required: ${remote_path}"
+        return 1
+    fi
+}
+
+# ============================================================
+# SECTION 11b — REUPLOAD FLAG HELPERS
+# ============================================================
+#
+# reupload.log is a persistent plain-text file (one FTP path per line)
+# that survives across runs and temp-dir cleanups.  Any path written here
+# is force-reuploaded on the next run regardless of SFTP state.
+# All operations are flock-protected for concurrent worker safety.
+
+# reupload_flag FTP_PATH
+# Appends FTP_PATH to REUPLOAD_LOG if not already present (idempotent).
+reupload_flag() {
+    local ftp_path="$1"
+    local lock="${REUPLOAD_LOG}.lock"
+    (
+        flock -x 200
+        touch "${REUPLOAD_LOG}"
+        if ! grep -qxF "${ftp_path}" "${REUPLOAD_LOG}" 2>/dev/null; then
+            echo "${ftp_path}" >> "${REUPLOAD_LOG}"
+        fi
+    ) 200>"${lock}"
+    log "WARN" "Flagged for re-upload in ${REUPLOAD_LOG}: ${ftp_path}"
+}
+
+# reupload_clear FTP_PATH
+# Removes FTP_PATH from REUPLOAD_LOG after a verified-clean upload.
+reupload_clear() {
+    local ftp_path="$1"
+    local lock="${REUPLOAD_LOG}.lock"
+    (
+        flock -x 200
+        if [[ -f "${REUPLOAD_LOG}" ]]; then
+            local tmp="${REUPLOAD_LOG}.tmp"
+            grep -vxF "${ftp_path}" "${REUPLOAD_LOG}" > "${tmp}" 2>/dev/null || true
+            mv "${tmp}" "${REUPLOAD_LOG}"
+        fi
+    ) 200>"${lock}"
+    log "INFO" "Cleared re-upload flag: ${ftp_path}"
+}
+
+# reupload_is_flagged FTP_PATH
+# Returns 0 (true) if FTP_PATH is in REUPLOAD_LOG, 1 (false) otherwise.
+reupload_is_flagged() {
+    local ftp_path="$1"
+    [[ -f "${REUPLOAD_LOG}" ]] || return 1
+    grep -qxF "${ftp_path}" "${REUPLOAD_LOG}" 2>/dev/null
+}
+
 # ============================================================
 # SECTION 12 — ATOMIC COUNTER HELPERS
 # ============================================================
@@ -1250,7 +1331,16 @@ EOF
         # worker can re-confirm the SFTP copy via checksum — skip this block.
         local transfer_needed=false transfer_reason="" is_overwrite=false
 
-        if [[ "${VERIFY_MODE}" == "true" ]]; then
+        # Check reupload.log first — a flagged file is always force-re-downloaded
+        # and re-uploaded regardless of its current state on SFTP.  This catches
+        # the case where a previous checksum failure was recorded and the SFTP
+        # delete may or may not have succeeded.
+        if reupload_is_flagged "${ftp_path}"; then
+            transfer_needed=true
+            is_overwrite=true
+            transfer_reason="flagged in reupload.log (previous checksum failure — forcing re-upload)"
+            log "WARN" "[DL${worker_id}] Re-upload flagged for: ${ftp_path}"
+        elif [[ "${VERIFY_MODE}" == "true" ]]; then
             # Force transfer regardless of what is already on SFTP
             transfer_needed=true
             local sftp_size_vm
@@ -1498,12 +1588,18 @@ EOF
 
                 # Checksum: re-download SFTP copy and compare against FTP-fresh staged file
                 if ! sftp_download_verify "${local_path}" "${sftp_dest_path}" "UL${worker_id}"; then
-                    log "ERROR" "[UL${worker_id}] [VERIFY] Checksum FAILED — SFTP copy does not match FTP source: ${sftp_dest_path}"
+                    log "ERROR" "[UL${worker_id}] [VERIFY] Checksum FAILED — flagging for re-upload and deleting corrupt SFTP copy: ${sftp_dest_path}"
+                    # 1. Write to reupload.log before delete attempt
+                    reupload_flag "${ftp_path}"
+                    # 2. Delete the corrupt SFTP copy
+                    sftp_delete_file "${sftp_dest_path}" "UL${worker_id}"
                     rm -f "${local_path}"
                     _inc_result "${result_file}" "ERRORS"
                     continue
                 fi
 
+                # Checksum passed — remove from reupload.log if previously flagged
+                reupload_clear "${ftp_path}"
                 log "INFO" "[UL${worker_id}] [VERIFY] Verified OK [${ftp_size} bytes, checksum OK]: ${ftp_path} → ${sftp_dest_path}"
                 rm -f "${local_path}"
                 upload_confirmed=true
@@ -1546,13 +1642,21 @@ EOF
                 # connection; controlled by VERIFY_CHECKSUM in the config.
                 if [[ "${VERIFY_CHECKSUM}" == "true" ]]; then
                     if ! sftp_download_verify "${local_path}" "${sftp_dest_path}" "UL${worker_id}"; then
-                        log "ERROR" "[UL${worker_id}] Checksum verification failed — upload may be corrupt: ${sftp_dest_path}"
+                        log "ERROR" "[UL${worker_id}] Checksum verification failed — flagging for re-upload and deleting corrupt SFTP copy: ${sftp_dest_path}"
+                        # 1. Write to reupload.log before delete attempt so the file
+                        #    is flagged even if the SFTP delete fails.
+                        reupload_flag "${ftp_path}"
+                        # 2. Delete the corrupt SFTP copy so the next run finds
+                        #    NOT_FOUND and re-uploads cleanly.
+                        sftp_delete_file "${sftp_dest_path}" "UL${worker_id}"
                         rm -f "${local_path}"
                         _inc_result "${result_file}" "ERRORS"
                         continue
                     fi
                 fi
 
+                # Checksum passed — remove from reupload.log if previously flagged
+                reupload_clear "${ftp_path}"
                 log "INFO" "[UL${worker_id}] Upload confirmed [${ftp_size} bytes, checksum OK]: ${ftp_path} → ${sftp_dest_path}"
                 rm -f "${local_path}"
                 upload_confirmed=true
@@ -1847,6 +1951,20 @@ main() {
     [[ "${DRY_RUN}"        == "true" ]] && log "INFO" "*** DRY-RUN MODE ENABLED — No files will be moved or deleted ***"
     [[ "${VERIFY_MODE}"    == "true" ]] && log "INFO" "*** VERIFY MODE ENABLED — All FTP files will be re-downloaded and SFTP copies checksum-verified ***"
     [[ "${VERIFY_CHECKSUM}" == "true" ]] && [[ "${VERIFY_MODE}" != "true" ]] && log "INFO" "Checksum verification enabled (VERIFY_CHECKSUM=true) — SFTP uploads will be re-downloaded and sha256-verified"
+
+    # Warn at startup if reupload.log has entries from a previous checksum failure
+    if [[ -f "${REUPLOAD_LOG}" ]]; then
+        local reupload_count
+        reupload_count=$(grep -c . "${REUPLOAD_LOG}" 2>/dev/null || echo 0)
+        if (( reupload_count > 0 )); then
+            log "WARN" "*** REUPLOAD PENDING: ${reupload_count} file(s) flagged for forced re-upload from a previous checksum failure ***"
+            log "WARN" "    Flagged file list: ${REUPLOAD_LOG}"
+            while IFS= read -r flagged_path; do
+                [[ -z "${flagged_path}" ]] && continue
+                log "WARN" "    Re-upload pending: ${flagged_path}"
+            done < "${REUPLOAD_LOG}"
+        fi
+    fi
 
     # 4. Check required dependencies (with interactive install prompt)
     check_dependencies
