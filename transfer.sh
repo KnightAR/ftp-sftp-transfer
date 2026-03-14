@@ -1182,7 +1182,11 @@ EOF
                 log "DEBUG" "Upload worker ${worker_id} — queue empty and all downloaders finished, exiting"
                 break
             fi
-            log "DEBUG" "Upload worker ${worker_id} — queue empty, waiting for downloaders (active=${active_dl})..."
+            # Suppress polling noise in dry-run — downloads finish near-instantly
+            # and flooding verbose output with wait messages adds no value
+            if [[ "${DRY_RUN}" != "true" ]]; then
+                log "DEBUG" "Upload worker ${worker_id} — queue empty, waiting for downloaders (active=${active_dl})..."
+            fi
             sleep 1
             continue
         fi
