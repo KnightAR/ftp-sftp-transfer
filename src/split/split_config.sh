@@ -62,7 +62,7 @@ apply_split_defaults() {
     # Parallel workers for part uploads / downloads.
     # Fall back to SFTP_MAX_WORKERS so the operator only needs one setting.
     : "${SPLIT_PART_WORKERS:=${SFTP_MAX_WORKERS:-10}}"
-    : "${SPLIT_RESTORE_WORKERS:=${SFTP_MAX_WORKERS:-10}}"
+    : "${SPLIT_RESTORE_WORKERS:=3}"
 
     # Suffix digit width — 5 digits = up to 99,999 parts
     : "${SPLIT_SUFFIX_LENGTH:=5}"
