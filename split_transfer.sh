@@ -420,54 +420,126 @@ print(int(s))
     local sftp_manifest_path="${sftp_base_dir}/${filename}.manifest"
     local sftp_parts_dir="${sftp_base_dir}/${SPLIT_PARTS_SUBDIR}"
 
-    # ---- Step 1: FTP → local ----
-    setup_ftp_connection
-    split_download_from_ftp "${ftp_path}" "${local_file}"
+    # ---- Resume detection ----
+    # Check whether a previous run left usable state in the staging directory.
+    # Three cases, evaluated in order:
+    #
+    #   RESUME  — local manifest + at least one part file already exist.
+    #             Skip FTP download, split, sha256, metadata collection, and
+    #             manifest write entirely.  Read the existing manifest to
+    #             populate MANIFEST_* variables and part hash/size arrays.
+    #
+    #   PARTIAL — original file is staged locally but parts do not exist yet
+    #             (e.g. previous run died between download and split).
+    #             Skip FTP download; re-run split+sha256 from the local file.
+    #
+    #   FULL    — nothing useful staged; run all steps.
 
-    local original_size
-    original_size=$(stat -c '%s' "${local_file}")
+    local original_size original_sha256
+    local existing_part_count
+    existing_part_count=$(find "${parts_dir}" -maxdepth 1 -name "${part_prefix}*" 2>/dev/null | wc -l)
 
-    # ---- Step 2: Concurrent sha256 + split ----
-    split_run_concurrent_hash_and_split \
-        "${local_file}" \
-        "${parts_dir}" \
-        "${part_prefix}" \
-        "${part_size_bytes}" \
-        "${SPLIT_SUFFIX_LENGTH}" \
-        "${hash_out_file}"
+    if [[ -f "${local_manifest}" ]] && (( existing_part_count > 0 )); then
+        # ---- RESUME MODE ----
+        log "INFO" "Resuming from existing local staging — skipping FTP download and split"
+        log "INFO" "  Local manifest : ${local_manifest}"
+        log "INFO" "  Parts found    : ${existing_part_count}"
+        read_manifest "${local_manifest}"
+        original_size="${MANIFEST_ORIGINAL_SIZE}"
+        original_sha256="${MANIFEST_ORIGINAL_SHA256}"
+        SPLIT_PART_COUNT="${MANIFEST_PART_COUNT}"
+        
 
-    # Extract original file hash from sha256sum output
-    local original_sha256
-    original_sha256=$(awk '{print $1}' "${hash_out_file}")
-    log "INFO" "Original file sha256: ${original_sha256}"
+    elif [[ -f "${local_file}" ]] && (( $(stat -c '%s' "${local_file}") > 0 )); then
+        # ---- PARTIAL MODE ----
+        log "INFO" "Local file already staged — skipping FTP download"
+        original_size=$(stat -c '%s' "${local_file}")
 
-    # ---- Step 3: Delete original (reclaim staging space) ----
-    log "INFO" "Deleting local copy of original file: ${local_file}"
-    rm -f "${local_file}"
+        # ---- Step 2: Concurrent sha256 + split ----
+        split_run_concurrent_hash_and_split \
+            "${local_file}" \
+            "${parts_dir}" \
+            "${part_prefix}" \
+            "${part_size_bytes}" \
+            "${SPLIT_SUFFIX_LENGTH}" \
+            "${hash_out_file}"
 
-    # ---- Step 4: Collect per-part metadata ----
-    split_collect_part_metadata \
-        "${parts_dir}" \
-        "${part_prefix}" \
-        "${parts_meta_file}"
+        original_sha256=$(awk '{print $1}' "${hash_out_file}")
+        log "INFO" "Original file sha256: ${original_sha256}"
 
-    # ---- Step 5: Write manifest ----
-    write_manifest \
-        "${local_manifest}" \
-        "${ftp_path}" \
-        "${filename}" \
-        "${original_size}" \
-        "${original_sha256}" \
-        "${part_size_bytes}" \
-        "${SPLIT_PART_COUNT}" \
-        "${part_prefix}" \
-        "${sftp_parts_dir}" \
-        "${parts_meta_file}"
+        # ---- Step 3: Delete original (reclaim staging space) ----
+        log "INFO" "Deleting local copy of original file: ${local_file}"
+        rm -f "${local_file}"
 
-    # ---- Step 6: Read manifest into memory ----
-    # Populates MANIFEST_PART_SIZE[] and MANIFEST_PART_SHA256[] associative
-    # arrays in the parent process so forked upload workers inherit them.
-    read_manifest "${local_manifest}"
+        # ---- Step 4: Collect per-part metadata ----
+        split_collect_part_metadata \
+            "${parts_dir}" \
+            "${part_prefix}" \
+            "${parts_meta_file}"
+
+        # ---- Step 5: Write manifest ----
+        write_manifest \
+            "${local_manifest}" \
+            "${ftp_path}" \
+            "${filename}" \
+            "${original_size}" \
+            "${original_sha256}" \
+            "${part_size_bytes}" \
+            "${SPLIT_PART_COUNT}" \
+            "${part_prefix}" \
+            "${sftp_parts_dir}" \
+            "${parts_meta_file}"
+
+        # ---- Step 6: Read manifest into memory ----
+        read_manifest "${local_manifest}"
+
+    else
+        # ---- FULL RUN ----
+        # ---- Step 1: FTP → local ----
+        setup_ftp_connection
+        split_download_from_ftp "${ftp_path}" "${local_file}"
+        original_size=$(stat -c '%s' "${local_file}")
+
+        # ---- Step 2: Concurrent sha256 + split ----
+        split_run_concurrent_hash_and_split \
+            "${local_file}" \
+            "${parts_dir}" \
+            "${part_prefix}" \
+            "${part_size_bytes}" \
+            "${SPLIT_SUFFIX_LENGTH}" \
+            "${hash_out_file}"
+
+        original_sha256=$(awk '{print $1}' "${hash_out_file}")
+        log "INFO" "Original file sha256: ${original_sha256}"
+
+        # ---- Step 3: Delete original (reclaim staging space) ----
+        log "INFO" "Deleting local copy of original file: ${local_file}"
+        rm -f "${local_file}"
+
+        # ---- Step 4: Collect per-part metadata ----
+        split_collect_part_metadata \
+            "${parts_dir}" \
+            "${part_prefix}" \
+            "${parts_meta_file}"
+
+        # ---- Step 5: Write manifest ----
+        write_manifest \
+            "${local_manifest}" \
+            "${ftp_path}" \
+            "${filename}" \
+            "${original_size}" \
+            "${original_sha256}" \
+            "${part_size_bytes}" \
+            "${SPLIT_PART_COUNT}" \
+            "${part_prefix}" \
+            "${sftp_parts_dir}" \
+            "${parts_meta_file}"
+
+        # ---- Step 6: Read manifest into memory ----
+        # Populates MANIFEST_PART_SIZE[] and MANIFEST_PART_SHA256[] associative
+        # arrays in the parent process so forked upload workers inherit them.
+        read_manifest "${local_manifest}"
+    fi
 
     # ---- Step 7: Create SFTP parts directory ----
     sftp_mkdir_p "${sftp_parts_dir}"

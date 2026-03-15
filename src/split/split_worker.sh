@@ -157,19 +157,47 @@ EOF
         fi
 
         # ---- Verify sha256 against manifest hash ----
-        # Re-download the uploaded part to a .verify temp file and compare its
-        # sha256 against the hash recorded in the manifest at split time.
-        # We compare against the manifest hash (not the local part file) because
-        # the local part file will be deleted immediately after this check passes.
+        # Re-download the uploaded part from SFTP to a .verify temp file and
+        # compare its sha256 against the manifest hash.  This confirms the
+        # remote copy is byte-perfect — not just that the upload source was clean.
+        #
+        # Concurrency throttle: use a flock token-slot semaphore so at most
+        # SPLIT_VERIFY_SLOTS (default 3) workers re-download simultaneously.
+        # This prevents connection overload on object-storage SFTP backends
+        # when all 10 upload workers try to pull 1 GiB each at the same time.
+        # Upload and queue-pop remain fully parallel — only the verify step is
+        # throttled.
         local expected_hash
         expected_hash=$(get_manifest_part_hash "${partname}")
         local verify_file="${local_part}.verify"
+        local verify_slots="${SPLIT_VERIFY_SLOTS:-3}"
+        local slot_acquired=false
+        local slot_fd slot_num
 
-        # Trap ensures .verify is always cleaned up even on early return
-        # shellcheck disable=SC2064
-        trap "rm -f '${verify_file}'" RETURN
+        # Try each slot in round-robin until we acquire one
+        # shellcheck disable=SC2034
+        for slot_num in $(seq 1 "${verify_slots}"); do
+            local slot_lock="${TEMP_DIR}/split_verify_slot_${slot_num}.lock"
+            # Non-blocking trylock — move to next slot if busy
+            if exec {slot_fd}>"${slot_lock}" && flock -n "${slot_fd}"; then
+                slot_acquired=true
+                break
+            fi
+            exec {slot_fd}>&- 2>/dev/null || true
+        done
 
-        if ! SSHPASS="${SFTP_PASS}" sshpass -e sftp \
+        # If all slots busy, fall back to blocking wait on slot 1
+        if [[ "${slot_acquired}" != true ]]; then
+            local slot_lock="${TEMP_DIR}/split_verify_slot_1.lock"
+            exec {slot_fd}>"${slot_lock}"
+            flock -x "${slot_fd}"
+        fi
+
+        log "DEBUG" "[SUL${worker_id}] Verify slot acquired — downloading for hash check: ${partname}"
+
+        local actual_hash=""
+        local verify_rc=0
+        if SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                 -P "${SFTP_PORT}" \
                 -o StrictHostKeyChecking=no \
                 -o BatchMode=no \
@@ -177,16 +205,22 @@ EOF
                 -o LogLevel=ERROR \
                 -b <(printf 'get %s %s\n' "${sftp_dest}" "${verify_file}") \
                 "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
+            actual_hash=$(sha256sum "${verify_file}" 2>/dev/null | awk '{print $1}')
+        else
+            verify_rc=1
+        fi
+
+        # Release verify slot
+        flock -u "${slot_fd}"
+        exec {slot_fd}>&-
+        rm -f "${verify_file}"
+
+        if (( verify_rc != 0 )); then
             log "ERROR" "[SUL${worker_id}] Failed to re-download part for hash verification: ${partname}"
             echo "FAILED" > "${status_file}"
             _inc_result "${result_file}" "ERRORS"
             continue
         fi
-
-        local actual_hash
-        actual_hash=$(sha256sum "${verify_file}" 2>/dev/null | awk '{print $1}')
-        rm -f "${verify_file}"
-        trap - RETURN
 
         if [[ "${actual_hash}" != "${expected_hash}" ]]; then
             log "ERROR" "[SUL${worker_id}] Part hash mismatch (manifest=${expected_hash}, sftp=${actual_hash}): ${partname}"
