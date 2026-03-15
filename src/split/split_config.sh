@@ -31,12 +31,18 @@
 #                         concurrent re-downloads to avoid overloading
 #                         object-storage SFTP connection limits while
 #                         keeping uploads fully parallel.  Default: 3.
-#   SPLIT_VERIFY_RETRIES     — number of times to retry a failed verify
+#   SPLIT_VERIFY_RETRIES      — number of times to retry a failed verify
 #                         re-download before marking the part as an error.
 #                         Handles transient SFTP connection rejections.
 #                         Default: 4.
-#   SPLIT_VERIFY_RETRY_SLEEP — seconds to wait between verify retry attempts.
+#   SPLIT_VERIFY_RETRY_SLEEP  — seconds to wait between verify retry attempts.
 #                         Default: 10.
+#   SPLIT_RESTORE_RETRIES     — number of times to retry a failed restore part
+#                         download before marking it as an error.  Handles
+#                         transient SFTP connection failures or empty listings.
+#                         Default: 4.
+#   SPLIT_RESTORE_RETRY_SLEEP — seconds to wait between restore download retry
+#                         attempts.  Default: 10.
 #
 # Dependency order:
 #   Must be called from within load_config() or after it, so that
@@ -64,6 +70,10 @@ apply_split_defaults() {
     # Retry attempts + sleep for failed verify re-downloads
     : "${SPLIT_VERIFY_RETRIES:=4}"
     : "${SPLIT_VERIFY_RETRY_SLEEP:=10}"
+
+    # Retry attempts + sleep for failed restore part downloads
+    : "${SPLIT_RESTORE_RETRIES:=4}"
+    : "${SPLIT_RESTORE_RETRY_SLEEP:=10}"
 }
 
 validate_split_config() {

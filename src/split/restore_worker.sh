@@ -15,7 +15,9 @@
 # Each worker instance:
 #   1. Atomically pops the next part filename from the shared
 #      download queue (TEMP_DIR/restore_part_queue.txt).
-#   2. Downloads the part from SFTP into PARTS_STAGING_DIR.
+#   2. Downloads the part from SFTP into PARTS_STAGING_DIR, retrying up
+#      to SPLIT_RESTORE_RETRIES times on failure (transient connection
+#      rejections or empty listings from object-storage backends).
 #   3. Verifies the downloaded size matches the manifest size for
 #      that part (fast check before sha256).
 #   4. Computes sha256 of the downloaded part and compares against
@@ -122,18 +124,40 @@ EOF
             fi
         fi
 
-        # ---- Download the part from SFTP ----
+        # ---- Download the part from SFTP (with retry) ----
+        # Object-storage SFTP backends can transiently return empty listings
+        # or reject connections under load.  Retry up to SPLIT_RESTORE_RETRIES
+        # times with SPLIT_RESTORE_RETRY_SLEEP seconds between attempts.
         log "INFO" "[RDL${worker_id}] Downloading part: ${sftp_src} → ${local_part}"
 
-        if ! SSHPASS="${SFTP_PASS}" sshpass -e sftp \
-                -P "${SFTP_PORT}" \
-                -o StrictHostKeyChecking=no \
-                -o BatchMode=no \
-                -o ConnectTimeout=60 \
-                -o LogLevel=ERROR \
-                -b <(printf 'get %s %s\n' "${sftp_src}" "${local_part}") \
-                "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
-            log "ERROR" "[RDL${worker_id}] SFTP download failed: ${partname}"
+        local dl_attempt=1
+        local dl_max="${SPLIT_RESTORE_RETRIES:-4}"
+        local dl_sleep="${SPLIT_RESTORE_RETRY_SLEEP:-10}"
+        local dl_ok=false
+
+        while (( dl_attempt <= dl_max )); do
+            rm -f "${local_part}"
+            if SSHPASS="${SFTP_PASS}" sshpass -e sftp \
+                    -P "${SFTP_PORT}" \
+                    -o StrictHostKeyChecking=no \
+                    -o BatchMode=no \
+                    -o ConnectTimeout=60 \
+                    -o LogLevel=ERROR \
+                    -b <(printf 'get %s %s\n' "${sftp_src}" "${local_part}") \
+                    "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
+                dl_ok=true
+                break
+            fi
+            rm -f "${local_part}"
+            if (( dl_attempt < dl_max )); then
+                log "WARN" "[RDL${worker_id}] Download attempt ${dl_attempt}/${dl_max} failed — retrying in ${dl_sleep}s: ${partname}"
+                sleep "${dl_sleep}"
+            fi
+            (( dl_attempt++ )) || true
+        done
+
+        if [[ "${dl_ok}" != true ]]; then
+            log "ERROR" "[RDL${worker_id}] SFTP download failed after ${dl_max} attempts: ${partname}"
             rm -f "${local_part}"
             echo "FAILED" > "${status_file}"
             _inc_result "${result_file}" "ERRORS"

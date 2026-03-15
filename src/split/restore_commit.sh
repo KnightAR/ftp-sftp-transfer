@@ -12,10 +12,10 @@
 #   append step without blocking downloads.
 #
 # Algorithm:
-#   next_idx=1
+#   next_idx=0
 #   loop:
 #     partname = build_part_name(next_idx)
-#     if next_idx > MANIFEST_PART_COUNT → break (all parts committed)
+#     if next_idx >= MANIFEST_PART_COUNT → break (all parts committed)
 #     status = read TEMP_DIR/restore_status/<partname>
 #     if status == VERIFIED:
 #       cat local_part >> output_file
@@ -80,7 +80,7 @@ restore_commit_thread() {
     local output_file="$1"
     local parts_staging_dir="$2"
     local done_file="${TEMP_DIR}/restore_commit.done"
-    local next_idx=1
+    local next_idx=0
     local committed=0
     local commit_failed=false
     local stall_count=0
@@ -96,7 +96,7 @@ restore_commit_thread() {
         : > "${output_file}"
     fi
 
-    while (( next_idx <= MANIFEST_PART_COUNT )); do
+    while (( next_idx < MANIFEST_PART_COUNT )); do
         # Build the part filename: prefix + zero-padded index
         local partname
         partname=$(printf '%s%0*d' \
