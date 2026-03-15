@@ -99,8 +99,10 @@ split_check_dependencies() {
 
 # ============================================================
 # split_download_from_ftp FTP_PATH LOCAL_DEST
-# Downloads a single file from FTP using lftp.
-# Returns the local file path written.
+# Downloads a single file from FTP using run_lftp() (reuses the same
+# FTP_CONNECT_STR / credentials / host as the rest of the pipeline).
+# lftp output is captured to a temp file so it appears in the log on
+# failure — never silenced completely.
 # ============================================================
 split_download_from_ftp() {
     local ftp_path="$1"
@@ -109,28 +111,32 @@ split_download_from_ftp() {
     ftp_dir=$(dirname "${ftp_path}")
     local ftp_file
     ftp_file=$(basename "${ftp_path}")
+    local dest_dir
+    dest_dir=$(dirname "${local_dest}")
+    local lftp_out="${TEMP_DIR}/split_lftp_download.log"
 
     log "INFO" "Downloading from FTP: ${ftp_path} → ${local_dest}"
 
-    local lftp_script
-    lftp_script=$(cat <<EOF
-set net:max-retries 3
-set net:reconnect-interval-base 10
-set net:timeout 120
-open ${FTP_CONNECT_STR}
-lcd $(dirname "${local_dest}")
-cd ${ftp_dir}
-get ${ftp_file} -o $(basename "${local_dest}")
-bye
-EOF
-)
-    if ! echo "${lftp_script}" | lftp &>/dev/null; then
-        log "ERROR" "lftp download failed for: ${ftp_path}"
+    # Use run_lftp() which already embeds FTP_CONNECT_STR + credentials + host.
+    # lcd into the destination directory so lftp writes the file there directly.
+    local rc=0
+    run_lftp "lcd ${dest_dir}; cd ${ftp_dir}; get ${ftp_file} -o $(basename "${local_dest}")" \
+        > "${lftp_out}" 2>&1 || rc=$?
+
+    # Always log lftp output — visible in DEBUG mode or on failure
+    if [[ -s "${lftp_out}" ]]; then
+        while IFS= read -r lftp_line; do
+            log "DEBUG" "[lftp] ${lftp_line}"
+        done < "${lftp_out}"
+    fi
+
+    if (( rc != 0 )); then
+        log "ERROR" "lftp download failed (rc=${rc}) for: ${ftp_path}"
         return 1
     fi
 
     if [[ ! -f "${local_dest}" ]]; then
-        log "ERROR" "Download completed but local file not found: ${local_dest}"
+        log "ERROR" "lftp exited OK but local file not found: ${local_dest}"
         return 1
     fi
 
