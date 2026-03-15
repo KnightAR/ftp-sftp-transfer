@@ -22,6 +22,7 @@
 
 load_config() {
     local config_file="${CLI_CONFIG:-${DEFAULT_CONFIG}}"
+    local sftp_only="${2:-false}"   # pass "sftp-only" as $2 to skip FTP validation
 
     if [[ ! -f "${config_file}" ]]; then
         echo "ERROR: Config file not found: ${config_file}" >&2
@@ -79,10 +80,11 @@ load_config() {
     # cleanup.  Default is alongside the script; override in config if needed.
     : "${REUPLOAD_LOG:=${SCRIPT_DIR}/reupload.log}"
 
-    validate_config
+    validate_config "${sftp_only}"
 }
 
 validate_config() {
+    local sftp_only="${1:-false}"
     local errors=0
 
     # Only credentials and server addresses have no safe default —
@@ -98,11 +100,13 @@ validate_config() {
         fi
     }
 
-    check_var "FTP_HOST"
-    check_var "FTP_PORT"
-    check_var "FTP_USER"
-    check_var "FTP_PASS"
-    check_var "FTP_REMOTE_DIR"
+    if [[ "${sftp_only}" != "sftp-only" ]]; then
+        check_var "FTP_HOST"
+        check_var "FTP_PORT"
+        check_var "FTP_USER"
+        check_var "FTP_PASS"
+        check_var "FTP_REMOTE_DIR"
+    fi
     check_var "SFTP_HOST"
     check_var "SFTP_PORT"
     check_var "SFTP_USER"
@@ -111,9 +115,11 @@ validate_config() {
 
     # Validate that numeric vars (whether from config or defaults) are actually numbers.
     # These checks catch the case where a user sets a variable to a non-numeric value.
-    if ! [[ "${FTP_PORT}"              =~ ^[0-9]+$ ]]; then
-        echo "ERROR: FTP_PORT must be a number, got: '${FTP_PORT}'" >&2
-        (( errors++ )) || true
+    if [[ "${sftp_only}" != "sftp-only" ]]; then
+        if ! [[ "${FTP_PORT}" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: FTP_PORT must be a number, got: '${FTP_PORT}'" >&2
+            (( errors++ )) || true
+        fi
     fi
     if ! [[ "${SFTP_PORT}"             =~ ^[0-9]+$ ]]; then
         echo "ERROR: SFTP_PORT must be a number, got: '${SFTP_PORT}'" >&2
@@ -123,9 +129,11 @@ validate_config() {
         echo "ERROR: RETENTION_DAYS must be a non-negative integer, got: '${RETENTION_DAYS}'" >&2
         (( errors++ )) || true
     fi
-    if ! [[ "${FTP_MAX_WORKERS}"       =~ ^[1-9][0-9]*$ ]]; then
-        echo "ERROR: FTP_MAX_WORKERS must be a positive integer, got: '${FTP_MAX_WORKERS}'" >&2
-        (( errors++ )) || true
+    if [[ "${sftp_only}" != "sftp-only" ]]; then
+        if ! [[ "${FTP_MAX_WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "ERROR: FTP_MAX_WORKERS must be a positive integer, got: '${FTP_MAX_WORKERS}'" >&2
+            (( errors++ )) || true
+        fi
     fi
     if ! [[ "${SFTP_MAX_WORKERS}"      =~ ^[1-9][0-9]*$ ]]; then
         echo "ERROR: SFTP_MAX_WORKERS must be a positive integer, got: '${SFTP_MAX_WORKERS}'" >&2

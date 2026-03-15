@@ -248,7 +248,8 @@ restore_main() {
     restore_parse_args "$@"
 
     # ---- Load and validate config ----
-    load_config "${RESTORE_CLI_CONFIG}"
+    # "sftp-only" skips FTP credential validation — restore only needs SFTP.
+    load_config "${RESTORE_CLI_CONFIG}" "sftp-only"
     apply_split_defaults
     validate_split_config
 
