@@ -464,19 +464,24 @@ print(int(s))
         "${sftp_parts_dir}" \
         "${parts_meta_file}"
 
-    # ---- Step 6: Create SFTP parts directory ----
+    # ---- Step 6: Read manifest into memory ----
+    # Populates MANIFEST_PART_SIZE[] and MANIFEST_PART_SHA256[] associative
+    # arrays in the parent process so forked upload workers inherit them.
+    read_manifest "${local_manifest}"
+
+    # ---- Step 7: Create SFTP parts directory ----
     sftp_mkdir_p "${sftp_parts_dir}"
 
-    # ---- Step 7: Upload manifest ----
+    # ---- Step 8: Upload manifest ----
     split_upload_manifest "${local_manifest}" "${sftp_manifest_path}"
 
-    # ---- Step 8: Upload parts in parallel ----
+    # ---- Step 9: Upload parts in parallel ----
     split_run_upload_workers \
         "${parts_dir}" \
         "${sftp_parts_dir}" \
         "${SPLIT_PART_WORKERS}"
 
-    # ---- Step 9: Check for failures ----
+    # ---- Step 10: Check for failures ----
     if (( SPLIT_CNT_FAILED > 0 || SPLIT_CNT_ERRORS > 0 )); then
         log "ERROR" "Split transfer completed with failures — ${SPLIT_CNT_FAILED} failed, ${SPLIT_CNT_ERRORS} errors"
         log "ERROR" "Re-run split_transfer.sh with the same arguments to resume"
@@ -486,7 +491,7 @@ print(int(s))
         exit 1
     fi
 
-    # ---- Step 10: Optionally delete original from FTP ----
+    # ---- Step 11: Optionally delete original from FTP ----
     if [[ "${SPLIT_CLI_NO_DELETE:-false}" != "true" ]] && \
        [[ "${DELETE_FROM_FTP:-false}" == "true" ]]; then
         log "INFO" "Deleting original file from FTP: ${ftp_path}"
