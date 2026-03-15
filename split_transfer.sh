@@ -254,18 +254,28 @@ split_collect_part_metadata() {
 split_upload_manifest() {
     local local_manifest="$1"
     local sftp_manifest_path="$2"
+    local sftp_out="${TEMP_DIR}/split_sftp_manifest.log"
 
     log "INFO" "Uploading manifest: ${sftp_manifest_path}"
 
-    if ! SSHPASS="${SFTP_PASS}" sshpass -e sftp \
+    local rc=0
+    SSHPASS="${SFTP_PASS}" sshpass -e sftp \
             -P "${SFTP_PORT}" \
             -o StrictHostKeyChecking=no \
             -o BatchMode=no \
             -o ConnectTimeout=30 \
             -o LogLevel=ERROR \
             -b <(printf 'put %s %s\n' "${local_manifest}" "${sftp_manifest_path}") \
-            "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
-        log "ERROR" "Failed to upload manifest to SFTP: ${sftp_manifest_path}"
+            "${SFTP_USER}@${SFTP_HOST}" > "${sftp_out}" 2>&1 || rc=$?
+
+    if [[ -s "${sftp_out}" ]]; then
+        while IFS= read -r sftp_line; do
+            log "DEBUG" "[sftp] ${sftp_line}"
+        done < "${sftp_out}"
+    fi
+
+    if (( rc != 0 )); then
+        log "ERROR" "Failed to upload manifest to SFTP (rc=${rc}): ${sftp_manifest_path}"
         return 1
     fi
 
@@ -398,8 +408,10 @@ print(int(s))
 
     # SFTP destination paths
     # Manifest sits in the same dir as the original FTP file would be
-    # Parts go into a "split" subdirectory under that
-    local sftp_base_dir="${ftp_dir}"
+    # Parts go into a "split" subdirectory under that.
+    # Strip a trailing slash from ftp_dir (happens when ftp_path is /file.tar
+    # and dirname returns "/") to avoid double-slash paths like //file.manifest.
+    local sftp_base_dir="${ftp_dir%/}"
     local sftp_manifest_path="${sftp_base_dir}/${filename}.manifest"
     local sftp_parts_dir="${sftp_base_dir}/${SPLIT_PARTS_SUBDIR}"
 
