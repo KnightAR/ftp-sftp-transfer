@@ -174,13 +174,27 @@ get_ftp_file_list() {
                 filepath="${dir_path}/${name}"
             fi
 
-            # Convert ls date to Unix epoch
-            # timeyr = HH:MM (recent file, use current year) or YYYY (older file)
+            # Convert ls date to Unix epoch.
+            # ls date format has two cases:
+            #   YYYY  - file is older than ~6 months; use the year as-is.
+            #   HH:MM - file is recent; ls omits the year and shows time instead.
+            #           We use the current year as a first guess, but if that
+            #           produces a future timestamp (e.g. "Sep 21 14:30" parsed
+            #           in March 2026 becomes Sep 21 2026) we subtract one year.
+            #           This correctly handles files from the past 12 months
+            #           regardless of which month the script is run in.
             current_year=$(date +%Y)
             if [[ "${timeyr}" =~ ^[0-9]{4}$ ]]; then
                 epoch=$(date -d "${mon} ${day} ${timeyr} 00:00:00" +%s 2>/dev/null || echo 0)
             else
                 epoch=$(date -d "${mon} ${day} ${current_year} ${timeyr}" +%s 2>/dev/null || echo 0)
+                # If the resulting epoch is in the future, the month/day has not
+                # occurred yet this calendar year -- it belongs to last year.
+                local now_epoch
+                now_epoch=$(date +%s)
+                if (( epoch > now_epoch )); then
+                    epoch=$(date -d "${mon} ${day} $(( current_year - 1 )) ${timeyr}" +%s 2>/dev/null || echo 0)
+                fi
             fi
 
             printf '%s %s %s\n' "${size}" "${epoch}" "${filepath}" >> "${listing_file}"
