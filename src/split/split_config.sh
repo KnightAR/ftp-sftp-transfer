@@ -25,12 +25,18 @@
 #   SPLIT_PARTS_SUBDIR  — name of the subdirectory created under the
 #                         original file's parent directory on SFTP to
 #                         hold the part files.  Default: "split".
-#   SPLIT_VERIFY_SLOTS  — maximum number of upload workers that may
+#   SPLIT_VERIFY_SLOTS       — maximum number of upload workers that may
 #                         re-download a part from SFTP simultaneously
 #                         for post-upload hash verification.  Throttles
 #                         concurrent re-downloads to avoid overloading
 #                         object-storage SFTP connection limits while
 #                         keeping uploads fully parallel.  Default: 3.
+#   SPLIT_VERIFY_RETRIES     — number of times to retry a failed verify
+#                         re-download before marking the part as an error.
+#                         Handles transient SFTP connection rejections.
+#                         Default: 4.
+#   SPLIT_VERIFY_RETRY_SLEEP — seconds to wait between verify retry attempts.
+#                         Default: 10.
 #
 # Dependency order:
 #   Must be called from within load_config() or after it, so that
@@ -54,6 +60,10 @@ apply_split_defaults() {
 
     # Max concurrent SFTP re-downloads during post-upload hash verification
     : "${SPLIT_VERIFY_SLOTS:=3}"
+
+    # Retry attempts + sleep for failed verify re-downloads
+    : "${SPLIT_VERIFY_RETRIES:=4}"
+    : "${SPLIT_VERIFY_RETRY_SLEEP:=10}"
 }
 
 validate_split_config() {

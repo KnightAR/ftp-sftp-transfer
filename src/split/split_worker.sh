@@ -199,26 +199,46 @@ EOF
 
         local actual_hash=""
         local verify_rc=0
-        if SSHPASS="${SFTP_PASS}" sshpass -e sftp \
-                -P "${SFTP_PORT}" \
-                -o StrictHostKeyChecking=no \
-                -o BatchMode=no \
-                -o ConnectTimeout=60 \
-                -o LogLevel=ERROR \
-                -b <(printf 'get %s %s\n' "${sftp_dest}" "${verify_file}") \
-                "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
-            actual_hash=$(sha256sum "${verify_file}" 2>/dev/null | awk '{print $1}')
-        else
+        local verify_attempt=1
+        local verify_max="${SPLIT_VERIFY_RETRIES:-4}"
+        local verify_sleep="${SPLIT_VERIFY_RETRY_SLEEP:-10}"
+
+        # Retry loop: transient SFTP connection failures (e.g. too many concurrent
+        # connections) should not permanently fail a part that was successfully
+        # uploaded.  The verify slot is held across retries to keep throttling in
+        # effect — releasing between attempts would allow immediate re-flooding.
+        while (( verify_attempt <= verify_max )); do
+            actual_hash=""
+            if SSHPASS="${SFTP_PASS}" sshpass -e sftp \
+                    -P "${SFTP_PORT}" \
+                    -o StrictHostKeyChecking=no \
+                    -o BatchMode=no \
+                    -o ConnectTimeout=60 \
+                    -o LogLevel=ERROR \
+                    -b <(printf 'get %s %s\n' "${sftp_dest}" "${verify_file}") \
+                    "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
+                actual_hash=$(sha256sum "${verify_file}" 2>/dev/null | awk '{print $1}')
+                rm -f "${verify_file}"
+                break
+            fi
+            rm -f "${verify_file}"
+            if (( verify_attempt < verify_max )); then
+                log "WARN" "[SUL${worker_id}] Verify re-download attempt ${verify_attempt}/${verify_max} failed — retrying in ${verify_sleep}s: ${partname}"
+                sleep "${verify_sleep}"
+            fi
+            (( verify_attempt++ )) || true
+        done
+
+        if [[ -z "${actual_hash}" ]]; then
             verify_rc=1
         fi
 
         # Release verify slot
         flock -u "${slot_fd}"
         exec {slot_fd}>&-
-        rm -f "${verify_file}"
 
         if (( verify_rc != 0 )); then
-            log "ERROR" "[SUL${worker_id}] Failed to re-download part for hash verification: ${partname}"
+            log "ERROR" "[SUL${worker_id}] Failed to re-download part for hash verification after ${verify_max} attempts: ${partname}"
             echo "FAILED" > "${status_file}"
             _inc_result "${result_file}" "ERRORS"
             continue
