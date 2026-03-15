@@ -132,8 +132,8 @@ restore_commit_thread() {
                 # Mark COMMITTED so workers/orchestrator know this part is done
                 echo "COMMITTED" > "${status_file}"
 
-                (( committed++ ))
-                (( next_idx++ ))
+                (( committed++ )) || true
+                (( next_idx++ )) || true
                 stall_count=0
                 ;;
 
@@ -147,13 +147,13 @@ restore_commit_thread() {
                 # Should not happen (we write COMMITTED ourselves and advance
                 # next_idx immediately), but handle gracefully.
                 log "WARN" "[COMMIT] Part already COMMITTED on entry — advancing: ${partname}"
-                (( next_idx++ ))
+                (( next_idx++ )) || true
                 stall_count=0
                 ;;
 
             *)
                 # Part not yet downloaded/verified — wait
-                (( stall_count++ ))
+                (( stall_count++ )) || true
                 if (( stall_count >= stall_limit )); then
                     log "ERROR" "[COMMIT] Stall timeout waiting for part ${next_idx}: ${partname} (status='${status}')"
                     commit_failed=true
@@ -190,7 +190,7 @@ wait_for_commit_thread() {
 
     while [[ ! -f "${done_file}" ]]; do
         sleep "${poll}"
-        (( elapsed += poll ))
+        (( elapsed += poll )) || true
         if (( elapsed >= timeout )); then
             log "ERROR" "Timed out waiting for commit thread after ${elapsed}s"
             return 1

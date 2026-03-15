@@ -219,7 +219,14 @@ split_collect_part_metadata() {
 
     SPLIT_PART_COUNT=0
 
-    # Parts are named <prefix>NNNNN — sort numerically by suffix
+    log "DEBUG" "Scanning for parts in: ${parts_dir} matching: ${part_prefix}*"
+
+    # Parts are named <prefix>NNNNN — sort numerically by suffix.
+    # Use -name with a quoted literal; the prefix may contain dots (e.g.
+    # blockchain.tar.xz.part.) which are valid in -name patterns but must
+    # not be expanded by the shell before find sees them.
+    # (( n++ )) evaluates to 0 when n=0, which is falsy under set -e —
+    # use || true to prevent set -e from aborting on the first part.
     local partfile partname part_size part_hash
     while IFS= read -r partfile; do
         partname=$(basename "${partfile}")
@@ -228,9 +235,14 @@ split_collect_part_metadata() {
         printf '%s  size=%s  sha256=%s\n' \
             "${partname}" "${part_size}" "${part_hash}" >> "${parts_meta_file}"
         echo "${partname}" >> "${queue_file}"
-        (( SPLIT_PART_COUNT++ ))
+        (( SPLIT_PART_COUNT++ )) || true
         log "DEBUG" "Part: ${partname}  size=${part_size}  sha256=${part_hash}"
     done < <(find "${parts_dir}" -maxdepth 1 -name "${part_prefix}*" | sort)
+
+    if (( SPLIT_PART_COUNT == 0 )); then
+        log "ERROR" "No parts found in ${parts_dir} matching '${part_prefix}*'"
+        return 1
+    fi
 
     log "INFO" "Collected metadata for ${SPLIT_PART_COUNT} parts"
 }
