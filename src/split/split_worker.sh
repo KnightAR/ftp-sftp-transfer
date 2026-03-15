@@ -51,9 +51,9 @@ split_upload_worker() {
     local worker_id="$1"
     local parts_staging_dir="$2"
     local sftp_parts_dir="$3"
-    local result_file="${TEMP_DIR}/workers/split_ul_worker_${worker_id}.result"
-    local queue_file="${TEMP_DIR}/split_part_queue.txt"
-    local lock_file="${TEMP_DIR}/split_part_queue.lock"
+    local result_file="${SPLIT_JOB_DIR}/workers/split_ul_worker_${worker_id}.result"
+    local queue_file="${SPLIT_JOB_DIR}/split_part_queue.txt"
+    local lock_file="${SPLIT_JOB_DIR}/split_part_queue.lock"
 
     cat > "${result_file}" <<EOF
 UPLOADED=0
@@ -75,9 +75,9 @@ EOF
                 sed -i '1d' "${queue_file}"
             fi
             echo "${_line}"
-        ) 200>"${lock_file}" > "${TEMP_DIR}/workers/split_ul_worker_${worker_id}.next"
+        ) 200>"${lock_file}" > "${SPLIT_JOB_DIR}/workers/split_ul_worker_${worker_id}.next"
 
-        partname=$(cat "${TEMP_DIR}/workers/split_ul_worker_${worker_id}.next")
+        partname=$(cat "${SPLIT_JOB_DIR}/workers/split_ul_worker_${worker_id}.next")
 
         if [[ -z "${partname}" ]]; then
             log "DEBUG" "Split upload worker ${worker_id} — queue empty, exiting"
@@ -86,7 +86,7 @@ EOF
 
         local local_part="${parts_staging_dir}/${partname}"
         local sftp_dest="${sftp_parts_dir}/${partname}"
-        local status_file="${TEMP_DIR}/split_status/${partname}"
+        local status_file="${SPLIT_JOB_DIR}/split_status/${partname}"
 
         # ---- Check if already uploaded on a previous run (resume support) ----
         local existing_size
@@ -179,7 +179,7 @@ EOF
         # Try each slot in round-robin until we acquire one
         # shellcheck disable=SC2034
         for slot_num in $(seq 1 "${verify_slots}"); do
-            local slot_lock="${TEMP_DIR}/split_verify_slot_${slot_num}.lock"
+            local slot_lock="${SPLIT_JOB_DIR}/split_verify_slot_${slot_num}.lock"
             # Non-blocking trylock — move to next slot if busy
             if exec {slot_fd}>"${slot_lock}" && flock -n "${slot_fd}"; then
                 slot_acquired=true
@@ -190,7 +190,7 @@ EOF
 
         # If all slots busy, fall back to blocking wait on slot 1
         if [[ "${slot_acquired}" != true ]]; then
-            local slot_lock="${TEMP_DIR}/split_verify_slot_1.lock"
+            local slot_lock="${SPLIT_JOB_DIR}/split_verify_slot_1.lock"
             exec {slot_fd}>"${slot_lock}"
             flock -x "${slot_fd}"
         fi
@@ -279,7 +279,7 @@ merge_split_upload_results() {
     SPLIT_CNT_SKIPPED=0
     SPLIT_CNT_ERRORS=0
 
-    for result_file in "${TEMP_DIR}/workers"/split_ul_worker_*.result; do
+    for result_file in "${SPLIT_JOB_DIR}/workers"/split_ul_worker_*.result; do
         [[ -f "${result_file}" ]] || continue
         while IFS='=' read -r key value; do
             [[ -z "${key}" ]] && continue

@@ -113,7 +113,7 @@ split_download_from_ftp() {
     ftp_file=$(basename "${ftp_path}")
     local dest_dir
     dest_dir=$(dirname "${local_dest}")
-    local lftp_out="${TEMP_DIR}/split_lftp_download.log"
+    local lftp_out="${SPLIT_JOB_DIR}/split_lftp_download.log"
 
     log "INFO" "Downloading from FTP: ${ftp_path} → ${local_dest}"
 
@@ -212,7 +212,7 @@ split_collect_part_metadata() {
     local parts_dir="$1"
     local part_prefix="$2"
     local parts_meta_file="$3"
-    local queue_file="${TEMP_DIR}/split_part_queue.txt"
+    local queue_file="${SPLIT_JOB_DIR}/split_part_queue.txt"
 
     : > "${parts_meta_file}"
     : > "${queue_file}"
@@ -254,7 +254,7 @@ split_collect_part_metadata() {
 split_upload_manifest() {
     local local_manifest="$1"
     local sftp_manifest_path="$2"
-    local sftp_out="${TEMP_DIR}/split_sftp_manifest.log"
+    local sftp_out="${SPLIT_JOB_DIR}/split_sftp_manifest.log"
 
     log "INFO" "Uploading manifest: ${sftp_manifest_path}"
 
@@ -292,7 +292,7 @@ split_run_upload_workers() {
     local sftp_parts_dir="$2"
     local num_workers="$3"
 
-    mkdir -p "${TEMP_DIR}/split_status" "${TEMP_DIR}/workers"
+    mkdir -p "${SPLIT_JOB_DIR}/split_status" "${SPLIT_JOB_DIR}/workers"
 
     log "INFO" "Spawning ${num_workers} split upload worker(s)"
     local pids=()
@@ -349,6 +349,11 @@ split_print_summary() {
 # Main entry point for split_transfer.sh.
 # ============================================================
 split_main() {
+    # ---- Preserve staging on failure so re-runs can resume ----
+    # trap_cleanup() checks this flag and skips cleanup_job_dir() on non-zero
+    # exit.  We call cleanup_job_dir() explicitly below only after full success.
+    SPLIT_PRESERVE_ON_FAILURE=true
+
     # ---- Parse CLI args ----
     split_parse_args "$@"
 
@@ -360,7 +365,17 @@ split_main() {
     # Override split settings from CLI flags if provided
     [[ -n "${SPLIT_CLI_SIZE}"     ]] && SPLIT_SIZE="${SPLIT_CLI_SIZE}"
     [[ -n "${SPLIT_CLI_WORKERS}"  ]] && SPLIT_PART_WORKERS="${SPLIT_CLI_WORKERS}"
-    [[ -n "${SPLIT_CLI_TEMP_DIR}" ]] && TEMP_DIR="${SPLIT_CLI_TEMP_DIR}"
+    # -t flag overrides SPLIT_TEMP_DIR from config
+    [[ -n "${SPLIT_CLI_TEMP_DIR}" ]] && SPLIT_TEMP_DIR="${SPLIT_CLI_TEMP_DIR}"
+
+    # split_transfer.sh requires a static temp directory — no mktemp fallback.
+    # A static path ensures staging survives a failed run for resume on re-run.
+    if [[ -z "${SPLIT_TEMP_DIR:-}" ]]; then
+        echo "ERROR: SPLIT_TEMP_DIR is not set. Set it in transfer.conf or use -t." >&2
+        echo "       A static path is required so staging survives failures for resume." >&2
+        exit 1
+    fi
+    TEMP_DIR="${SPLIT_TEMP_DIR}"
 
     # ---- Setup (order matters: temp dir must exist before logging) ----
     setup_temp_dir
@@ -394,16 +409,20 @@ for sfx,mult in m.items():
 print(int(s))
 ")
 
-    # Local staging paths
-    local staging_dir="${TEMP_DIR}/split_staging"
-    mkdir -p "${staging_dir}"
-    local local_file="${staging_dir}/${filename}"
-    local parts_dir="${staging_dir}/parts"
+    # ---- Set up per-job directory ----
+    # Each job gets its own subdirectory under TEMP_DIR scoped by filename,
+    # so concurrent jobs and cleanup never interfere with each other.
+    SPLIT_JOB_DIR="${TEMP_DIR}/${filename}"
+    mkdir -p "${SPLIT_JOB_DIR}"
+
+    # Local staging paths (all inside the job dir)
+    local local_file="${SPLIT_JOB_DIR}/${filename}"
+    local parts_dir="${SPLIT_JOB_DIR}/parts"
     mkdir -p "${parts_dir}"
     local part_prefix="${filename}.part."
-    local hash_out_file="${staging_dir}/${filename}.sha256"
-    local parts_meta_file="${staging_dir}/${filename}.partsmeta"
-    local local_manifest="${staging_dir}/${filename}.manifest"
+    local hash_out_file="${SPLIT_JOB_DIR}/${filename}.sha256"
+    local parts_meta_file="${SPLIT_JOB_DIR}/${filename}.partsmeta"
+    local local_manifest="${SPLIT_JOB_DIR}/${filename}.manifest"
 
     # SFTP destination paths
     # Manifest sits in the same dir as the original FTP file would be.
@@ -452,7 +471,7 @@ print(int(s))
         # Rebuild the upload queue from the parts still present locally.
         # Previously-uploaded parts were deleted after verification, so only
         # parts that are physically present still need uploading.
-        local queue_file="${TEMP_DIR}/split_part_queue.txt"
+        local queue_file="${SPLIT_JOB_DIR}/split_part_queue.txt"
         : > "${queue_file}"
         local queued_count=0
         while IFS= read -r partfile; do
@@ -586,6 +605,13 @@ print(int(s))
     split_print_summary \
         "${original_size}" "${original_sha256}" \
         "${SPLIT_PART_COUNT}" "${sftp_manifest_path}"
+
+    # ---- Allow cleanup on success ----
+    # On any earlier failure path we exited before reaching here, so the job
+    # directory is preserved by trap_cleanup() (SPLIT_PRESERVE_ON_FAILURE=true)
+    # for re-run resume.  Clear the flag now so the EXIT trap's
+    # cleanup_job_dir() call removes SPLIT_JOB_DIR normally.
+    SPLIT_PRESERVE_ON_FAILURE=false
 
     log "INFO" "split_transfer.sh complete — all ${SPLIT_PART_COUNT} parts uploaded and verified"
 }

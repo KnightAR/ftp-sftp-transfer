@@ -130,11 +130,11 @@ restore_download_manifest() {
 # Also creates the restore_status and workers directories.
 # ============================================================
 restore_build_queue() {
-    local queue_file="${TEMP_DIR}/restore_part_queue.txt"
+    local queue_file="${RESTORE_JOB_DIR}/restore_part_queue.txt"
     : > "${queue_file}"
 
-    mkdir -p "${TEMP_DIR}/restore_status"
-    mkdir -p "${TEMP_DIR}/workers"
+    mkdir -p "${RESTORE_JOB_DIR}/restore_status"
+    mkdir -p "${RESTORE_JOB_DIR}/workers"
 
     # Build queue directly from the manifest's [parts] section.
     # MANIFEST_PART_SIZE keys are the authoritative part names in the exact
@@ -263,7 +263,17 @@ restore_main() {
 
     # Override settings from CLI flags if provided
     [[ -n "${RESTORE_CLI_WORKERS}"  ]] && SPLIT_RESTORE_WORKERS="${RESTORE_CLI_WORKERS}"
-    [[ -n "${RESTORE_CLI_TEMP_DIR}" ]] && TEMP_DIR="${RESTORE_CLI_TEMP_DIR}"
+    # -t flag overrides SPLIT_TEMP_DIR from config
+    [[ -n "${RESTORE_CLI_TEMP_DIR}" ]] && SPLIT_TEMP_DIR="${RESTORE_CLI_TEMP_DIR}"
+
+    # split_restore.sh requires a static temp directory — no mktemp fallback.
+    # A static path ensures staging survives a failed run for resume on re-run.
+    if [[ -z "${SPLIT_TEMP_DIR:-}" ]]; then
+        echo "ERROR: SPLIT_TEMP_DIR is not set. Set it in transfer.conf or use -t." >&2
+        echo "       A static path is required so staging survives failures for resume." >&2
+        exit 1
+    fi
+    TEMP_DIR="${SPLIT_TEMP_DIR}"
 
     # Set verify-only mode from CLI flag
     RESTORE_VERIFY_ONLY="${RESTORE_CLI_VERIFY:-false}"
@@ -292,12 +302,17 @@ restore_main() {
     log "INFO" "  Workers    : ${SPLIT_RESTORE_WORKERS}"
 
     # ---- Step 1: Download and parse manifest ----
-    local staging_dir="${TEMP_DIR}/restore_staging"
-    mkdir -p "${staging_dir}"
-    local parts_dir="${staging_dir}/parts"
+    # Per-job directory scoped by manifest basename (minus .manifest suffix),
+    # with .restore appended to avoid collision with a concurrent split_transfer
+    # job for the same file.  e.g. blockchain.tar.xz.manifest → blockchain.tar.xz.restore/
+    local manifest_basename
+    manifest_basename=$(basename "${RESTORE_CLI_MANIFEST}" .manifest)
+    RESTORE_JOB_DIR="${TEMP_DIR}/${manifest_basename}.restore"
+    mkdir -p "${RESTORE_JOB_DIR}"
+    local parts_dir="${RESTORE_JOB_DIR}/parts"
     mkdir -p "${parts_dir}"
 
-    local local_manifest="${staging_dir}/manifest"
+    local local_manifest="${RESTORE_JOB_DIR}/manifest"
     restore_download_manifest "${RESTORE_CLI_MANIFEST}" "${local_manifest}"
     read_manifest "${local_manifest}"
     verify_manifest_header
@@ -361,15 +376,12 @@ restore_main() {
         restore_print_summary "${output_file}" "${verify_status}"
     fi
 
-    # ---- Cleanup staging on success ----
-    # Now that the restore is fully verified, clean up the staging directory.
-    # On any earlier failure path we exited before reaching here, so staging
-    # is preserved by trap_cleanup() (RESTORE_PRESERVE_ON_FAILURE=true) for
-    # re-run resume.  We clear the flag before calling cleanup so trap_cleanup()
-    # (triggered by the EXIT trap after this function returns) does not try to
-    # clean a second time.
+    # ---- Allow cleanup on success ----
+    # On any earlier failure path we exited before reaching here, so the job
+    # directory is preserved by trap_cleanup() (RESTORE_PRESERVE_ON_FAILURE=true)
+    # for re-run resume.  Clear the flag now so the EXIT trap's
+    # cleanup_job_dir() call removes RESTORE_JOB_DIR normally.
     RESTORE_PRESERVE_ON_FAILURE=false
-    cleanup_temp
 
     log "INFO" "split_restore.sh complete"
 }

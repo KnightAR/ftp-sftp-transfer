@@ -34,9 +34,20 @@ LOCK_FD=9
 
 # ---- Runtime state ----
 TEMP_DIR_CREATED=false          # true when mktemp created TEMP_DIR (cleanup_temp removes it entirely)
-# When true, trap_cleanup() will NOT call cleanup_temp() on a non-zero exit.
-# Set by split_restore.sh so that staging parts survive a failed run for resume.
-# Cleanup is done explicitly in restore_main() only after successful completion.
+
+# Per-job subdirectories under TEMP_DIR.  Each split job gets its own scoped
+# directory so concurrent jobs and cleanup never interfere with each other.
+#   split_transfer.sh  → TEMP_DIR/<filename>/
+#   split_restore.sh   → TEMP_DIR/<filename>.restore/
+# Set by split_main() / restore_main() once the filename is known.
+SPLIT_JOB_DIR=""
+RESTORE_JOB_DIR=""
+
+# When true, trap_cleanup() will NOT call cleanup_job_dir() on a non-zero exit,
+# preserving staging parts for resume on re-run.
+# SPLIT_PRESERVE_ON_FAILURE  — set by split_transfer.sh
+# RESTORE_PRESERVE_ON_FAILURE — set by split_restore.sh
+SPLIT_PRESERVE_ON_FAILURE=false
 RESTORE_PRESERVE_ON_FAILURE=false
 LOG_FILE=""              # Set by setup_logging() once LOG_DIR is known from config
 ERROR_LOG_FILE=""        # Set by setup_logging(); errors are mirrored here in addition to LOG_FILE

@@ -89,6 +89,30 @@ setup_temp_dir() {
     touch "${TEMP_DIR}/ul_idle_report.lock"
 }
 
+# cleanup_job_dir JOB_DIR
+# Removes the per-job subdirectory created by split_transfer.sh or
+# split_restore.sh.  Each job uses its own scoped directory under TEMP_DIR
+# (SPLIT_JOB_DIR or RESTORE_JOB_DIR) so this call only ever touches that
+# one job's files — it cannot affect other concurrent jobs or transfer.sh.
+#
+# JOB_DIR must be a non-empty path that is a direct child of TEMP_DIR.
+# The safety check prevents accidental rm -rf of arbitrary paths.
+cleanup_job_dir() {
+    local job_dir="${1:-}"
+    if [[ -z "${job_dir}" ]]; then
+        return 0
+    fi
+    # Safety: job_dir must be a non-empty subdir of a non-empty TEMP_DIR
+    if [[ -z "${TEMP_DIR:-}" ]] || [[ "${job_dir}" == "${TEMP_DIR}" ]]; then
+        log "WARN" "cleanup_job_dir: refusing to remove job_dir that equals TEMP_DIR: ${job_dir}"
+        return 1
+    fi
+    if [[ -d "${job_dir}" ]]; then
+        rm -rf "${job_dir}"
+        log "DEBUG" "Removed job directory: ${job_dir}"
+    fi
+}
+
 cleanup_temp() {
     if [[ "${TEMP_DIR_CREATED}" == true ]] && [[ -d "${TEMP_DIR:-}" ]]; then
         # mktemp-created directory — remove entirely
@@ -98,6 +122,7 @@ cleanup_temp() {
         # Custom directory — remove only the files/subdirs this script created,
         # leaving the directory itself and any pre-existing contents untouched.
         if [[ -d "${TEMP_DIR:-}" ]]; then
+            # ---- transfer.sh / split_transfer.sh paths ----
             rm -rf "${TEMP_DIR:?}/staging"
             rm -rf "${TEMP_DIR:?}/workers"
             rm -rf "${TEMP_DIR:?}/mirror_dummy"

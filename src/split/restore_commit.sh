@@ -79,7 +79,7 @@ COMMIT_POLL_INTERVAL="${COMMIT_POLL_INTERVAL:-2}"
 restore_commit_thread() {
     local output_file="$1"
     local parts_staging_dir="$2"
-    local done_file="${TEMP_DIR}/restore_commit.done"
+    local done_file="${RESTORE_JOB_DIR}/restore_commit.done"
     local next_idx=0
     local committed=0
     local commit_failed=false
@@ -108,7 +108,7 @@ restore_commit_thread() {
             "${MANIFEST_PART_SUFFIX_LEN}" \
             "${next_idx}")
 
-        local status_file="${TEMP_DIR}/restore_status/${partname}"
+        local status_file="${RESTORE_JOB_DIR}/restore_status/${partname}"
         local local_part="${parts_staging_dir}/${partname}"
         local status=""
 
@@ -188,7 +188,7 @@ restore_commit_thread() {
 # Default timeout: 7200 seconds (2 hours).
 wait_for_commit_thread() {
     local timeout="${1:-7200}"
-    local done_file="${TEMP_DIR}/restore_commit.done"
+    local done_file="${RESTORE_JOB_DIR}/restore_commit.done"
     local elapsed=0
     local poll=5
 

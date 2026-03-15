@@ -43,6 +43,12 @@
 #                         Default: 4.
 #   SPLIT_RESTORE_RETRY_SLEEP — seconds to wait between restore download retry
 #                         attempts.  Default: 10.
+#   SPLIT_TEMP_DIR      — required base temp directory for split_transfer.sh
+#                         and split_restore.sh.  Must be set in transfer.conf
+#                         or via -t on the CLI.  Unlike transfer.sh, split
+#                         scripts do NOT fall back to mktemp — a static path
+#                         is required so staging survives a failed run for
+#                         resume.  Example: /mnt/helium/temp
 #
 # Dependency order:
 #   Must be called from within load_config() or after it, so that
@@ -74,6 +80,10 @@ apply_split_defaults() {
     # Retry attempts + sleep for failed restore part downloads
     : "${SPLIT_RESTORE_RETRIES:=4}"
     : "${SPLIT_RESTORE_RETRY_SLEEP:=10}"
+
+    # Static temp directory for split scripts — no mktemp fallback.
+    # Required for resume: staging must survive a failed run.
+    : "${SPLIT_TEMP_DIR:=}"
 }
 
 validate_split_config() {
@@ -108,6 +118,10 @@ validate_split_config() {
         echo "ERROR: SPLIT_PARTS_SUBDIR must be a simple directory name with no slashes (got: '${SPLIT_PARTS_SUBDIR}')" >&2
         (( errors++ )) || true
     fi
+
+    # SPLIT_TEMP_DIR is validated in split_main()/restore_main() after CLI
+    # overrides are applied — not here, because -t may not have been parsed yet
+    # when validate_split_config() is first called.
 
     if (( errors > 0 )); then
         echo "ERROR: ${errors} split configuration error(s) found." >&2

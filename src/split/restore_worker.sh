@@ -60,9 +60,9 @@ restore_download_worker() {
     local worker_id="$1"
     local parts_staging_dir="$2"
     local sftp_parts_dir="$3"
-    local result_file="${TEMP_DIR}/workers/restore_dl_worker_${worker_id}.result"
-    local queue_file="${TEMP_DIR}/restore_part_queue.txt"
-    local lock_file="${TEMP_DIR}/restore_part_queue.lock"
+    local result_file="${RESTORE_JOB_DIR}/workers/restore_dl_worker_${worker_id}.result"
+    local queue_file="${RESTORE_JOB_DIR}/restore_part_queue.txt"
+    local lock_file="${RESTORE_JOB_DIR}/restore_part_queue.lock"
 
     cat > "${result_file}" <<EOF
 VERIFIED=0
@@ -84,9 +84,9 @@ EOF
                 sed -i '1d' "${queue_file}"
             fi
             echo "${_line}"
-        ) 200>"${lock_file}" > "${TEMP_DIR}/workers/restore_dl_worker_${worker_id}.next"
+        ) 200>"${lock_file}" > "${RESTORE_JOB_DIR}/workers/restore_dl_worker_${worker_id}.next"
 
-        partname=$(cat "${TEMP_DIR}/workers/restore_dl_worker_${worker_id}.next")
+        partname=$(cat "${RESTORE_JOB_DIR}/workers/restore_dl_worker_${worker_id}.next")
 
         if [[ -z "${partname}" ]]; then
             log "DEBUG" "Restore download worker ${worker_id} — queue empty, exiting"
@@ -95,7 +95,7 @@ EOF
 
         local local_part="${parts_staging_dir}/${partname}"
         local sftp_src="${sftp_parts_dir}/${partname}"
-        local status_file="${TEMP_DIR}/restore_status/${partname}"
+        local status_file="${RESTORE_JOB_DIR}/restore_status/${partname}"
 
         local expected_size
         expected_size=$(get_manifest_part_size "${partname}")
@@ -229,7 +229,7 @@ merge_restore_download_results() {
     RESTORE_CNT_SKIPPED=0
     RESTORE_CNT_ERRORS=0
 
-    for result_file in "${TEMP_DIR}/workers"/restore_dl_worker_*.result; do
+    for result_file in "${RESTORE_JOB_DIR}/workers"/restore_dl_worker_*.result; do
         [[ -f "${result_file}" ]] || continue
         while IFS='=' read -r key value; do
             [[ -z "${key}" ]] && continue

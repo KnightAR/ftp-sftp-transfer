@@ -17,8 +17,10 @@
 #   3. Force-kills (SIGKILL) any workers still running after the
 #      grace period, preventing orphaned processes writing to
 #      paths that cleanup_temp() is about to delete.
-#   4. Calls cleanup_temp() to remove the staging area.
-#   5. Calls release_lock() to remove the PID lock file.
+#   4. Calls cleanup_temp() to remove transfer.sh staging files.
+#   5. Calls cleanup_job_dir() for SPLIT_JOB_DIR / RESTORE_JOB_DIR unless
+#      the corresponding preserve flag is set (failure path — keep for resume).
+#   6. Calls release_lock() to remove the PID lock file.
 #
 # The trap is intentionally removed at the end of a clean run
 # in main() (via "trap - INT TERM EXIT") so that the final
@@ -65,15 +67,26 @@ trap_cleanup() {
         kill -9 "${WORKER_PIDS[@]}" 2>/dev/null || true
     fi
 
-    # When RESTORE_PRESERVE_ON_FAILURE=true (set by split_restore.sh), skip
-    # cleanup_temp on a non-zero exit so that downloaded staging parts and status
-    # files survive for resume on re-run.  Cleanup is done explicitly in
-    # restore_main() only after successful completion.
-    if [[ "${RESTORE_PRESERVE_ON_FAILURE:-false}" == "true" ]] && (( exit_code != 0 )); then
-        log "INFO" "Preserving staging directory for resume (RESTORE_PRESERVE_ON_FAILURE=true): ${TEMP_DIR:-}"
+    # Always clean up transfer.sh / setup_temp_dir() files.
+    cleanup_temp
+
+    # Per-job directories for split scripts are cleaned via cleanup_job_dir()
+    # unless the preserve flag is set (failure path — keep staging for resume).
+    #
+    # SPLIT_PRESERVE_ON_FAILURE   — set by split_transfer.sh
+    # RESTORE_PRESERVE_ON_FAILURE — set by split_restore.sh
+    if [[ "${SPLIT_PRESERVE_ON_FAILURE:-false}" == "true" ]] && (( exit_code != 0 )); then
+        log "INFO" "Preserving split job directory for resume: ${SPLIT_JOB_DIR:-}"
     else
-        cleanup_temp
+        cleanup_job_dir "${SPLIT_JOB_DIR:-}"
     fi
+
+    if [[ "${RESTORE_PRESERVE_ON_FAILURE:-false}" == "true" ]] && (( exit_code != 0 )); then
+        log "INFO" "Preserving restore job directory for resume: ${RESTORE_JOB_DIR:-}"
+    else
+        cleanup_job_dir "${RESTORE_JOB_DIR:-}"
+    fi
+
     release_lock
     exit "${exit_code}"
 }
