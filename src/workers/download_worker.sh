@@ -239,6 +239,17 @@ EOF
 
         log "DEBUG" "[DL${worker_id}] Download verified (${ftp_size} bytes): ${ftp_path}"
 
+        # ---- 10a. Archive integrity check ----
+        local verify_arc_rc=0
+        verify_archive_integrity "${local_file}" || verify_arc_rc=$?
+        if (( verify_arc_rc == 1 )); then
+            log "ERROR" "[DL${worker_id}] Archive integrity check failed — discarding: ${ftp_path}"
+            rm -f "${local_file}"
+            _inc_result "${result_file}" "ERRORS"
+            continue
+        fi
+        # rc=2 means not a known archive format — treat as plain file, continue normally
+
         # ---- 11. Count and enqueue for SFTP upload ----
         if [[ "${is_overwrite}" == true ]]; then
             _inc_result "${result_file}" "OVERWRITTEN"

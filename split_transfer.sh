@@ -73,6 +73,7 @@ source "${SCRIPT_DIR}/src/system/temp.sh"
 source "${SCRIPT_DIR}/src/system/trap.sh"
 source "${SCRIPT_DIR}/src/transfer/ftp.sh"
 source "${SCRIPT_DIR}/src/transfer/sftp.sh"
+source "${SCRIPT_DIR}/src/transfer/archive_verify.sh"
 source "${SCRIPT_DIR}/src/transfer/ftp_delete.sh"
 source "${SCRIPT_DIR}/src/workers/counters.sh"
 source "${SCRIPT_DIR}/src/split/split_config.sh"
@@ -483,6 +484,15 @@ print(int(s))
         log "INFO" "Local file already staged — skipping FTP download"
         original_size=$(stat -c '%s' "${local_file}")
 
+        # ---- Step 1a: Archive integrity check ----
+        local arc_rc=0
+        verify_archive_integrity "${local_file}" || arc_rc=$?
+        if (( arc_rc == 1 )); then
+            log "ERROR" "Archive integrity check failed — aborting: ${local_file}"
+            exit 1
+        fi
+        # arc_rc=2 means not a known archive format — continue as plain file
+
         # ---- Step 2: Concurrent sha256 + split ----
         split_run_concurrent_hash_and_split \
             "${local_file}" \
@@ -527,6 +537,15 @@ print(int(s))
         setup_ftp_connection
         split_download_from_ftp "${ftp_path}" "${local_file}"
         original_size=$(stat -c '%s' "${local_file}")
+
+        # ---- Step 1a: Archive integrity check ----
+        local arc_rc=0
+        verify_archive_integrity "${local_file}" || arc_rc=$?
+        if (( arc_rc == 1 )); then
+            log "ERROR" "Archive integrity check failed — aborting: ${local_file}"
+            exit 1
+        fi
+        # arc_rc=2 means not a known archive format — continue as plain file
 
         # ---- Step 2: Concurrent sha256 + split ----
         split_run_concurrent_hash_and_split \

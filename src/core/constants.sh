@@ -49,6 +49,10 @@ RESTORE_JOB_DIR=""
 # RESTORE_PRESERVE_ON_FAILURE — set by split_restore.sh
 SPLIT_PRESERVE_ON_FAILURE=false
 RESTORE_PRESERVE_ON_FAILURE=false
+
+# VERIFY_ARCHIVE_INTEGRITY — when true, test downloaded archives for structural
+# validity before further processing.  Set to false in config or via CLI to skip.
+VERIFY_ARCHIVE_INTEGRITY=true
 LOG_FILE=""              # Set by setup_logging() once LOG_DIR is known from config
 ERROR_LOG_FILE=""        # Set by setup_logging(); errors are mirrored here in addition to LOG_FILE
 FTP_CONNECT_STR=""       # Assembled lftp connection string; set by setup_ftp_connection()

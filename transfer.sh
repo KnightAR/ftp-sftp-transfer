@@ -64,6 +64,7 @@ source "${SCRIPT_DIR}/src/system/trap.sh"       # registers trap at source time
 source "${SCRIPT_DIR}/src/transfer/exclusions.sh"
 source "${SCRIPT_DIR}/src/transfer/ftp.sh"
 source "${SCRIPT_DIR}/src/transfer/sftp.sh"
+source "${SCRIPT_DIR}/src/transfer/archive_verify.sh"
 source "${SCRIPT_DIR}/src/transfer/reupload.sh"
 source "${SCRIPT_DIR}/src/transfer/ftp_delete.sh"
 

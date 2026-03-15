@@ -75,6 +75,10 @@ load_config() {
     # it already exists on SFTP, re-verify checksums, then run retention deletions.
     # Intended as a one-time bulk re-confirmation run after a prior upload session.
     : "${VERIFY_MODE:=false}"
+    # VERIFY_ARCHIVE_INTEGRITY: when true (default), test downloaded archive files
+    # for structural validity before queuing for SFTP upload.  Non-archive files
+    # are silently skipped.  Set to false in transfer.conf to disable.
+    : "${VERIFY_ARCHIVE_INTEGRITY:=true}"
     # REUPLOAD_LOG: persistent file listing FTP paths that must be force-reuploaded
     # on the next run due to a previous checksum failure.  Survives temp dir
     # cleanup.  Default is alongside the script; override in config if needed.

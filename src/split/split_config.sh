@@ -84,6 +84,11 @@ apply_split_defaults() {
     # Static temp directory for split scripts — no mktemp fallback.
     # Required for resume: staging must survive a failed run.
     : "${SPLIT_TEMP_DIR:=}"
+
+    # VERIFY_ARCHIVE_INTEGRITY: when true (default), test the downloaded file for
+    # structural validity before splitting.  Non-archive files are silently skipped.
+    # Set to false in transfer.conf to disable.
+    : "${VERIFY_ARCHIVE_INTEGRITY:=true}"
 }
 
 validate_split_config() {
