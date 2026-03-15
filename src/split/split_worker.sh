@@ -105,7 +105,7 @@ EOF
             if SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                     -P "${SFTP_PORT}" \
                     -o StrictHostKeyChecking=no \
-                    -o BatchMode=yes \
+                    -o BatchMode=no \
                     -o ConnectTimeout=5 \
                     -o ServerAliveInterval=15 \
                     -o ServerAliveCountMax=3 \
@@ -139,7 +139,7 @@ EOF
         if ! SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                 -P "${SFTP_PORT}" \
                 -o StrictHostKeyChecking=no \
-                -o BatchMode=yes \
+                -o BatchMode=no \
                 -o ConnectTimeout=5 \
                 -o ServerAliveInterval=15 \
                 -o ServerAliveCountMax=3 \
@@ -216,7 +216,7 @@ EOF
             if SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                     -P "${SFTP_PORT}" \
                     -o StrictHostKeyChecking=no \
-                    -o BatchMode=yes \
+                    -o BatchMode=no \
                     -o ConnectTimeout=5 \
                     -o ServerAliveInterval=15 \
                     -o ServerAliveCountMax=3 \
@@ -256,7 +256,7 @@ EOF
             SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                 -P "${SFTP_PORT}" \
                 -o StrictHostKeyChecking=no \
-                -o BatchMode=yes \
+                -o BatchMode=no \
                 -o ConnectTimeout=5 \
                 -o ServerAliveInterval=15 \
                 -o ServerAliveCountMax=3 \

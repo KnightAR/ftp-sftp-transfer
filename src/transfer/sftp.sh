@@ -67,7 +67,7 @@ sftp_get_size() {
     raw_ls=$(SSHPASS="${SFTP_PASS}" sshpass -e sftp \
         -P "${SFTP_PORT}" \
         -o StrictHostKeyChecking=no \
-        -o BatchMode=yes \
+        -o BatchMode=no \
         -o ConnectTimeout=5 \
         -o ServerAliveInterval=15 \
         -o ServerAliveCountMax=3 \
@@ -175,7 +175,7 @@ sftp_mkdir_p() {
     SSHPASS="${SFTP_PASS}" sshpass -e sftp \
         -P "${SFTP_PORT}" \
         -o StrictHostKeyChecking=no \
-        -o BatchMode=yes \
+        -o BatchMode=no \
         -o ConnectTimeout=5 \
         -o ServerAliveInterval=15 \
         -o ServerAliveCountMax=3 \
@@ -217,7 +217,7 @@ sftp_download_verify() {
     if ! SSHPASS="${SFTP_PASS}" sshpass -e sftp \
             -P "${SFTP_PORT}" \
             -o StrictHostKeyChecking=no \
-            -o BatchMode=yes \
+            -o BatchMode=no \
             -o ConnectTimeout=5 \
             -o ServerAliveInterval=15 \
             -o ServerAliveCountMax=3 \
@@ -267,7 +267,7 @@ sftp_delete_file() {
     if SSHPASS="${SFTP_PASS}" sshpass -e sftp \
             -P "${SFTP_PORT}" \
             -o StrictHostKeyChecking=no \
-            -o BatchMode=yes \
+            -o BatchMode=no \
             -o ConnectTimeout=5 \
             -o ServerAliveInterval=15 \
             -o ServerAliveCountMax=3 \
