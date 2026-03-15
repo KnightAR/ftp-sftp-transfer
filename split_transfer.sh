@@ -448,6 +448,18 @@ print(int(s))
         original_size="${MANIFEST_ORIGINAL_SIZE}"
         original_sha256="${MANIFEST_ORIGINAL_SHA256}"
         SPLIT_PART_COUNT="${MANIFEST_PART_COUNT}"
+
+        # Rebuild the upload queue from the parts still present locally.
+        # Previously-uploaded parts were deleted after verification, so only
+        # parts that are physically present still need uploading.
+        local queue_file="${TEMP_DIR}/split_part_queue.txt"
+        : > "${queue_file}"
+        local queued_count=0
+        while IFS= read -r partfile; do
+            echo "$(basename "${partfile}")" >> "${queue_file}"
+            (( queued_count++ )) || true
+        done < <(find "${parts_dir}" -maxdepth 1 -name "${part_prefix}*" | sort)
+        log "INFO" "  Queue rebuilt  : ${queued_count} part(s) remaining to upload"
         
 
     elif [[ -f "${local_file}" ]] && (( $(stat -c '%s' "${local_file}") > 0 )); then

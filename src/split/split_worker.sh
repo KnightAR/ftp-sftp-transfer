@@ -24,6 +24,8 @@
 #      because we compare against the pre-computed manifest hash
 #      rather than the local staged file (which is deleted after
 #      the sha256 was recorded at split time).
+#      Re-downloads are throttled to SPLIT_VERIFY_SLOTS concurrent
+#      workers via a flock token-slot semaphore.
 #   6. On verify OK  — deletes the local part file immediately to
 #      free staging space, marks part as UPLOADED in the shared
 #      status directory.
