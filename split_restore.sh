@@ -259,6 +259,14 @@ restore_main() {
     # Set verify-only mode from CLI flag
     RESTORE_VERIFY_ONLY="${RESTORE_CLI_VERIFY:-false}"
 
+    # Derive default output path from manifest basename if -o was not given.
+    # /some/dir/blockchain.tar.xz.manifest  →  <cwd>/blockchain.tar.xz
+    if [[ -z "${RESTORE_CLI_OUTPUT}" ]] && [[ "${RESTORE_VERIFY_ONLY}" != "true" ]]; then
+        local manifest_basename
+        manifest_basename=$(basename "${RESTORE_CLI_MANIFEST}")
+        RESTORE_CLI_OUTPUT="${PWD}/${manifest_basename%.manifest}"
+    fi
+
     # ---- Setup (order matters: temp dir must exist before logging) ----
     setup_temp_dir
     setup_logging

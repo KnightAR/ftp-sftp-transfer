@@ -16,7 +16,7 @@
 #   manifest_path  SFTP path of the .manifest file (required, first argument)
 #
 # Flags:
-#   -o PATH   Local output file path (required unless -V)
+#   -o PATH   Local output file path (default: <cwd>/<original_filename>)
 #   -c FILE   Config file path
 #   -p N      Parallel download workers
 #   -t DIR    Staging directory override
@@ -54,7 +54,8 @@ Positional:
                  e.g. /backups/blockchain-etl-20211222.tar.bz2.manifest
 
 Optional:
-  -o PATH   Local output file path             (required unless -V)
+  -o PATH   Local output file path
+            (default: <cwd>/<original_filename>, e.g. ./blockchain.tar.xz)
             e.g. /data/blockchain-etl-20211222.tar.bz2
   -c FILE   Config file                        (default: ./transfer.conf)
   -p N      Parallel SFTP download workers     (default: 10)
@@ -92,6 +93,8 @@ restore_parse_args() {
         restore_usage
     fi
 
+    # RESTORE_CLI_OUTPUT and RESTORE_CLI_VERIFY are read by restore_main() in split_restore.sh
+    # shellcheck disable=SC2034
     while getopts ":o:c:p:t:Vvh" opt; do
         case "${opt}" in
             o) RESTORE_CLI_OUTPUT="${OPTARG}" ;;
@@ -113,12 +116,9 @@ restore_parse_args() {
         exit 1
     fi
 
-    # -o is required unless -V (verify-only)
-    if [[ -z "${RESTORE_CLI_OUTPUT}" ]] && [[ "${RESTORE_CLI_VERIFY}" != true ]]; then
-        echo "ERROR: -o OUTPUT_PATH is required unless using -V (verify-only mode)." >&2
-        echo "       Run ${SCRIPT_NAME} -h for usage." >&2
-        exit 1
-    fi
+    # -o defaults to <cwd>/<manifest_basename minus .manifest suffix>
+    # Resolution happens in restore_main() once we know the manifest path;
+    # no error here — an empty RESTORE_CLI_OUTPUT is valid.
 
     # Propagate CLI overrides into the variables that load_config / split_config read.
     # All target vars are consumed by other sourced modules — not unused.
