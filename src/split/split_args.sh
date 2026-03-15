@@ -6,11 +6,16 @@
 # handle argument processing for split_transfer.sh:
 #
 #   split_usage()       — prints the help text and exits
-#   split_parse_args()  — processes getopts flags and populates
-#                         SPLIT_CLI_* override variables
+#   split_parse_args()  — processes positional arg + getopts flags
+#                         and populates SPLIT_CLI_* override variables
+#
+# Usage:
+#   split_transfer.sh <ftp_path> [OPTIONS]
+#
+# Positional:
+#   ftp_path  FTP source file path (required, first argument)
 #
 # Flags:
-#   -f PATH   FTP source file path (required)
 #   -c FILE   Config file path
 #   -s SIZE   Part size (split -b syntax, e.g. 500m, 2g)
 #   -p N      Parallel upload workers
@@ -25,7 +30,7 @@
 # ============================================================
 
 # ---- CLI override variables ----
-SPLIT_CLI_FTP_PATH=""       # -f  required: FTP source file path
+SPLIT_CLI_FTP_PATH=""       # positional arg 1: FTP source file path
 SPLIT_CLI_CONFIG=""         # -c  path to transfer.conf
 SPLIT_CLI_SIZE=""           # -s  part size override
 SPLIT_CLI_WORKERS=""        # -p  parallel worker count override
@@ -41,11 +46,11 @@ Downloads a single large file from FTP, splits it into parts,
 uploads all parts to SFTP in parallel with per-part checksum
 verification, then deletes the FTP source.
 
-Usage: ${SCRIPT_NAME} [OPTIONS]
+Usage: ${SCRIPT_NAME} <ftp_path> [OPTIONS]
 
-Required:
-  -f PATH   FTP source file path
-            e.g. /blockchain-etl-20211222.tar.bz2
+Positional:
+  ftp_path  FTP source file path
+            e.g. /backups/blockchain-etl-20211222.tar.bz2
 
 Optional:
   -c FILE   Config file                     (default: ./transfer.conf)
@@ -64,10 +69,10 @@ SFTP output layout:
   ...
 
 Examples:
-  ${SCRIPT_NAME} -f /blockchain-etl-20211222.tar.bz2
-  ${SCRIPT_NAME} -f /blockchain-etl-20211222.tar.bz2 -s 2g -p 5
-  ${SCRIPT_NAME} -f /www/htdocs.tar.bz2 -n
-  ${SCRIPT_NAME} -f /large-backup.tar.bz2 -v
+  ${SCRIPT_NAME} /backups/blockchain-etl-20211222.tar.bz2
+  ${SCRIPT_NAME} /backups/blockchain-etl-20211222.tar.bz2 -s 2g -p 5
+  ${SCRIPT_NAME} /www/htdocs.tar.bz2 -n
+  ${SCRIPT_NAME} /large-backup.tar.bz2 -v
 EOF
     exit 0
 }
@@ -77,9 +82,17 @@ split_parse_args() {
         split_usage
     fi
 
-    while getopts ":f:c:s:p:t:nvh" opt; do
+    # First argument is the required positional FTP path
+    SPLIT_CLI_FTP_PATH="$1"
+    shift
+
+    # Treat a lone -h before the positional arg gracefully
+    if [[ "${SPLIT_CLI_FTP_PATH}" == "-h" || "${SPLIT_CLI_FTP_PATH}" == "--help" ]]; then
+        split_usage
+    fi
+
+    while getopts ":c:s:p:t:nvh" opt; do
         case "${opt}" in
-            f) SPLIT_CLI_FTP_PATH="${OPTARG}" ;;
             c) SPLIT_CLI_CONFIG="${OPTARG}" ;;
             s) SPLIT_CLI_SIZE="${OPTARG}" ;;
             p) SPLIT_CLI_WORKERS="${OPTARG}" ;;
@@ -92,17 +105,17 @@ split_parse_args() {
         esac
     done
 
-    # -f is required
+    # Validate positional arg
     if [[ -z "${SPLIT_CLI_FTP_PATH}" ]]; then
-        echo "ERROR: -f FTP_PATH is required." >&2
+        echo "ERROR: ftp_path is required." >&2
         echo "       Run ${SCRIPT_NAME} -h for usage." >&2
         exit 1
     fi
 
     # Propagate CLI overrides into the variables that load_config / split_config read
-    [[ -n "${SPLIT_CLI_CONFIG}" ]]  && DEFAULT_CONFIG="${SPLIT_CLI_CONFIG}"
-    [[ -n "${SPLIT_CLI_SIZE}" ]]    && SPLIT_SIZE="${SPLIT_CLI_SIZE}"
-    [[ -n "${SPLIT_CLI_WORKERS}" ]] && SPLIT_PART_WORKERS="${SPLIT_CLI_WORKERS}"
+    [[ -n "${SPLIT_CLI_CONFIG}" ]]   && DEFAULT_CONFIG="${SPLIT_CLI_CONFIG}"
+    [[ -n "${SPLIT_CLI_SIZE}" ]]     && SPLIT_SIZE="${SPLIT_CLI_SIZE}"
+    [[ -n "${SPLIT_CLI_WORKERS}" ]]  && SPLIT_PART_WORKERS="${SPLIT_CLI_WORKERS}"
     [[ -n "${SPLIT_CLI_TEMP_DIR}" ]] && TEMP_DIR="${SPLIT_CLI_TEMP_DIR}"
     [[ "${SPLIT_CLI_VERBOSE}" == true ]] && CLI_VERBOSE=true
 }

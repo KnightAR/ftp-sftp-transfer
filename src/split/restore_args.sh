@@ -6,12 +6,17 @@
 # handle argument processing for split_restore.sh:
 #
 #   restore_usage()       — prints the help text and exits
-#   restore_parse_args()  — processes getopts flags and populates
-#                           RESTORE_CLI_* override variables
+#   restore_parse_args()  — processes positional arg + getopts flags
+#                           and populates RESTORE_CLI_* override variables
+#
+# Usage:
+#   split_restore.sh <manifest_path> [OPTIONS]
+#
+# Positional:
+#   manifest_path  SFTP path of the .manifest file (required, first argument)
 #
 # Flags:
-#   -f PATH   SFTP manifest path (required)
-#   -o PATH   Local output file path (required)
+#   -o PATH   Local output file path (required unless -V)
 #   -c FILE   Config file path
 #   -p N      Parallel download workers
 #   -t DIR    Staging directory override
@@ -25,7 +30,7 @@
 # ============================================================
 
 # ---- CLI override variables ----
-RESTORE_CLI_MANIFEST=""     # -f  required: SFTP manifest path
+RESTORE_CLI_MANIFEST=""     # positional arg 1: SFTP manifest path
 RESTORE_CLI_OUTPUT=""       # -o  required (unless -V): local output file path
 RESTORE_CLI_CONFIG=""       # -c  path to transfer.conf
 RESTORE_CLI_WORKERS=""      # -p  parallel worker count override
@@ -42,15 +47,15 @@ manifest hash, reassembles them in order via streaming concat
 (parts are appended and deleted as they arrive to minimise disk
 usage), then verifies the final file sha256 against the manifest.
 
-Usage: ${SCRIPT_NAME} [OPTIONS]
+Usage: ${SCRIPT_NAME} <manifest_path> [OPTIONS]
 
-Required:
-  -f PATH   SFTP manifest path
-            e.g. /backups/blockchain-etl-20211222.tar.bz2.manifest
-  -o PATH   Local output file path             (required unless -V)
-            e.g. /data/blockchain-etl-20211222.tar.bz2
+Positional:
+  manifest_path  SFTP path of the .manifest file
+                 e.g. /backups/blockchain-etl-20211222.tar.bz2.manifest
 
 Optional:
+  -o PATH   Local output file path             (required unless -V)
+            e.g. /data/blockchain-etl-20211222.tar.bz2
   -c FILE   Config file                        (default: ./transfer.conf)
   -p N      Parallel SFTP download workers     (default: 10)
   -t DIR    Override staging/temp dir          (this run only)
@@ -64,10 +69,10 @@ Disk usage note:
   Peak disk at staging dir  ≈ N_workers × part_size (parts deleted as committed)
 
 Examples:
-  ${SCRIPT_NAME} -f /backups/blockchain-etl-20211222.tar.bz2.manifest \\
+  ${SCRIPT_NAME} /backups/blockchain-etl-20211222.tar.bz2.manifest \\
                  -o /data/blockchain-etl-20211222.tar.bz2
-  ${SCRIPT_NAME} -f /backups/blockchain-etl-20211222.tar.bz2.manifest -V
-  ${SCRIPT_NAME} -f /backups/blockchain-etl-20211222.tar.bz2.manifest \\
+  ${SCRIPT_NAME} /backups/blockchain-etl-20211222.tar.bz2.manifest -V
+  ${SCRIPT_NAME} /backups/blockchain-etl-20211222.tar.bz2.manifest \\
                  -o /data/blockchain-etl-20211222.tar.bz2 -p 5 -v
 EOF
     exit 0
@@ -78,9 +83,17 @@ restore_parse_args() {
         restore_usage
     fi
 
-    while getopts ":f:o:c:p:t:Vvh" opt; do
+    # First argument is the required positional manifest path
+    RESTORE_CLI_MANIFEST="$1"
+    shift
+
+    # Treat a lone -h before the positional arg gracefully
+    if [[ "${RESTORE_CLI_MANIFEST}" == "-h" || "${RESTORE_CLI_MANIFEST}" == "--help" ]]; then
+        restore_usage
+    fi
+
+    while getopts ":o:c:p:t:Vvh" opt; do
         case "${opt}" in
-            f) RESTORE_CLI_MANIFEST="${OPTARG}" ;;
             o) RESTORE_CLI_OUTPUT="${OPTARG}" ;;
             c) RESTORE_CLI_CONFIG="${OPTARG}" ;;
             p) RESTORE_CLI_WORKERS="${OPTARG}" ;;
@@ -93,9 +106,9 @@ restore_parse_args() {
         esac
     done
 
-    # -f is always required
+    # Validate positional arg
     if [[ -z "${RESTORE_CLI_MANIFEST}" ]]; then
-        echo "ERROR: -f MANIFEST_PATH is required." >&2
+        echo "ERROR: manifest_path is required." >&2
         echo "       Run ${SCRIPT_NAME} -h for usage." >&2
         exit 1
     fi

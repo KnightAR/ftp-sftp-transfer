@@ -8,13 +8,15 @@
 # so split_restore.sh can later reconstruct and verify the original.
 #
 # Usage:
-#   ./split_transfer.sh [OPTIONS]
+#   ./split_transfer.sh <ftp_path> [OPTIONS]
+#
+# Positional:
+#   ftp_path        FTP path of the file to transfer (required)
 #
 # Options:
-#   -f FTP_PATH     FTP path of the file to transfer (required)
 #   -c CONFIG       Config file path (default: transfer.conf)
 #   -s SIZE         Part size, e.g. 500m, 2g (default: 1g)
-#   -p WORKERS      Parallel upload workers (default: 4)
+#   -p WORKERS      Parallel upload workers (default: 10)
 #   -t TEMP_DIR     Override temp directory
 #   -n              No delete — keep original FTP file after split
 #   -v              Verbose / debug logging

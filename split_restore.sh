@@ -8,14 +8,16 @@
 # manifest.
 #
 # Usage:
-#   ./split_restore.sh [OPTIONS]
+#   ./split_restore.sh <manifest_path> [OPTIONS]
+#
+# Positional:
+#   manifest_path   SFTP path of the .manifest file (required)
 #
 # Options:
-#   -f MANIFEST     SFTP path of the .manifest file (required)
 #   -o OUTPUT       Local path to write the reassembled file
 #                   (required unless -V / --verify-only)
 #   -c CONFIG       Config file path (default: transfer.conf)
-#   -p WORKERS      Parallel download workers (default: 4)
+#   -p WORKERS      Parallel download workers (default: 10)
 #   -t TEMP_DIR     Override temp directory
 #   -V              Verify-only — download + verify parts without
 #                   assembling output file (checks SFTP integrity)
