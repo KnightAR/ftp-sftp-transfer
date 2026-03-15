@@ -59,6 +59,19 @@ log() {
         print_stdout=true
     fi
 
+    # If LOG_FILE is not yet initialised (early bootstrap before setup_logging
+    # has run), fall back to stderr/stdout only — no file write attempted.
+    if [[ -z "${LOG_FILE}" ]]; then
+        if [[ "${print_stdout}" == true ]]; then
+            if [[ "${level}" == "ERROR" ]]; then
+                echo "${line}" >&2
+            else
+                echo "${line}"
+            fi
+        fi
+        return 0
+    fi
+
     # Atomic write: flock on the general log file descriptor
     (
         flock -x 200
