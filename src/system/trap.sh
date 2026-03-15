@@ -36,7 +36,9 @@
 
 trap_cleanup() {
     local exit_code=$?
-    log "WARN" "Script interrupted or exited unexpectedly (exit code: ${exit_code}). Cleaning up..."
+    if (( exit_code != 0 )); then
+        log "WARN" "Script interrupted or exited unexpectedly (exit code: ${exit_code}). Cleaning up..."
+    fi
 
     # Kill all tracked worker processes before wiping staging.
     # This prevents workers writing to paths that cleanup_temp is about to delete,
