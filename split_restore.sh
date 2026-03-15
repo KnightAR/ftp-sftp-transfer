@@ -247,6 +247,11 @@ restore_print_summary() {
 # Main entry point for split_restore.sh.
 # ============================================================
 restore_main() {
+    # ---- Preserve staging on failure so re-runs can resume ----
+    # trap_cleanup() checks this flag and skips cleanup_temp() on non-zero exit.
+    # We call cleanup_temp() explicitly below only after full success.
+    RESTORE_PRESERVE_ON_FAILURE=true
+
     # ---- Parse CLI args ----
     restore_parse_args "$@"
 
@@ -355,6 +360,16 @@ restore_main() {
     else
         restore_print_summary "${output_file}" "${verify_status}"
     fi
+
+    # ---- Cleanup staging on success ----
+    # Now that the restore is fully verified, clean up the staging directory.
+    # On any earlier failure path we exited before reaching here, so staging
+    # is preserved by trap_cleanup() (RESTORE_PRESERVE_ON_FAILURE=true) for
+    # re-run resume.  We clear the flag before calling cleanup so trap_cleanup()
+    # (triggered by the EXIT trap after this function returns) does not try to
+    # clean a second time.
+    RESTORE_PRESERVE_ON_FAILURE=false
+    cleanup_temp
 
     log "INFO" "split_restore.sh complete"
 }

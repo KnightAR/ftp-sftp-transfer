@@ -65,7 +65,15 @@ trap_cleanup() {
         kill -9 "${WORKER_PIDS[@]}" 2>/dev/null || true
     fi
 
-    cleanup_temp
+    # When RESTORE_PRESERVE_ON_FAILURE=true (set by split_restore.sh), skip
+    # cleanup_temp on a non-zero exit so that downloaded staging parts and status
+    # files survive for resume on re-run.  Cleanup is done explicitly in
+    # restore_main() only after successful completion.
+    if [[ "${RESTORE_PRESERVE_ON_FAILURE:-false}" == "true" ]] && (( exit_code != 0 )); then
+        log "INFO" "Preserving staging directory for resume (RESTORE_PRESERVE_ON_FAILURE=true): ${TEMP_DIR:-}"
+    else
+        cleanup_temp
+    fi
     release_lock
     exit "${exit_code}"
 }

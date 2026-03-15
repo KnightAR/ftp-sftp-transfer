@@ -33,7 +33,11 @@ LOCK_FILE="/tmp/ftp_sftp_transfer.lock"
 LOCK_FD=9
 
 # ---- Runtime state ----
-TEMP_DIR_CREATED=false   # true when mktemp created TEMP_DIR (cleanup_temp removes it entirely)
+TEMP_DIR_CREATED=false          # true when mktemp created TEMP_DIR (cleanup_temp removes it entirely)
+# When true, trap_cleanup() will NOT call cleanup_temp() on a non-zero exit.
+# Set by split_restore.sh so that staging parts survive a failed run for resume.
+# Cleanup is done explicitly in restore_main() only after successful completion.
+RESTORE_PRESERVE_ON_FAILURE=false
 LOG_FILE=""              # Set by setup_logging() once LOG_DIR is known from config
 ERROR_LOG_FILE=""        # Set by setup_logging(); errors are mirrored here in addition to LOG_FILE
 FTP_CONNECT_STR=""       # Assembled lftp connection string; set by setup_ftp_connection()

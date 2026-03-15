@@ -29,9 +29,11 @@
 #      after appending.
 #   6. On verify FAIL — logs error, marks FAILED, deletes the
 #      corrupt local part file so a re-run re-downloads it cleanly.
-#   7. Resume support: if a part file already exists locally AND its
-#      size and sha256 match the manifest, marks it VERIFIED without
-#      re-downloading (handles interrupted restore runs).
+#   7. Resume support: if the status file for a part already says COMMITTED
+#      (staging preserved from a prior failed run), skips the part entirely —
+#      it was already appended to the output file.  If the local part file
+#      exists with matching size+sha256, marks it VERIFIED without
+#      re-downloading.
 #   8. Writes a per-worker result file for summary merging.
 #
 # Shared state files (all under TEMP_DIR):
@@ -99,6 +101,21 @@ EOF
         expected_size=$(get_manifest_part_size "${partname}")
         local expected_hash
         expected_hash=$(get_manifest_part_hash "${partname}")
+
+        # ---- Resume: skip if already committed in a prior run ----
+        # Since staging is preserved on failure (RESTORE_PRESERVE_ON_FAILURE=true),
+        # the status file from the previous run survives.  If it says COMMITTED,
+        # the part was already appended to the output file and the local part file
+        # was deleted by the commit thread — nothing left to do.
+        if [[ -f "${status_file}" ]]; then
+            local prior_status
+            prior_status=$(cat "${status_file}" 2>/dev/null || true)
+            if [[ "${prior_status}" == "COMMITTED" ]]; then
+                log "INFO" "[RDL${worker_id}] Part already committed in prior run — skipping: ${partname}"
+                _inc_result "${result_file}" "SKIPPED"
+                continue
+            fi
+        fi
 
         # ---- Resume: check if part already downloaded and verified ----
         if [[ -f "${local_part}" ]]; then

@@ -90,10 +90,14 @@ restore_commit_thread() {
 
     log "DEBUG" "Restore commit thread started (PID $$)"
 
-    # Truncate (or create) the output file before we begin appending,
-    # unless verify-only mode — in that case we never touch the output.
+    # Create the output file if it does not exist yet.
+    # Do NOT truncate an existing file — it may contain data from a prior
+    # run that was interrupted.  Parts already committed in a prior run will
+    # have COMMITTED status files on disk (staging is preserved on failure),
+    # so the commit loop will advance past them via the COMMITTED branch
+    # without re-appending.  Verify-only mode never touches the output file.
     if [[ "${RESTORE_VERIFY_ONLY:-false}" != "true" ]]; then
-        : > "${output_file}"
+        [[ -f "${output_file}" ]] || : > "${output_file}"
     fi
 
     while (( next_idx < MANIFEST_PART_COUNT )); do
