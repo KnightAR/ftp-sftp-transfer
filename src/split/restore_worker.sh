@@ -134,10 +134,16 @@ EOF
                 # Hash mismatch on existing local file — re-download
                 log "WARN" "[RDL${worker_id}] Local part hash mismatch — re-downloading: ${partname}"
                 rm -f "${local_part}"
+                # Clear any stale VERIFIED status so the commit thread does not
+                # try to append this part while it is being re-downloaded.
+                rm -f "${status_file}"
             else
                 # Wrong size — truncated/corrupt download, re-download
                 log "WARN" "[RDL${worker_id}] Local part size mismatch (expected=${expected_size}, got=${existing_size}) — re-downloading: ${partname}"
                 rm -f "${local_part}"
+                # Clear any stale VERIFIED status so the commit thread does not
+                # try to append this part while it is being re-downloaded.
+                rm -f "${status_file}"
             fi
         fi
 
