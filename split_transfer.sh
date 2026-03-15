@@ -368,14 +368,11 @@ split_main() {
     # -t flag overrides SPLIT_TEMP_DIR from config
     [[ -n "${SPLIT_CLI_TEMP_DIR}" ]] && SPLIT_TEMP_DIR="${SPLIT_CLI_TEMP_DIR}"
 
-    # split_transfer.sh requires a static temp directory — no mktemp fallback.
-    # A static path ensures staging survives a failed run for resume on re-run.
-    if [[ -z "${SPLIT_TEMP_DIR:-}" ]]; then
-        echo "ERROR: SPLIT_TEMP_DIR is not set. Set it in transfer.conf or use -t." >&2
-        echo "       A static path is required so staging survives failures for resume." >&2
-        exit 1
+    # If SPLIT_TEMP_DIR is explicitly set (config or -t flag), use it as TEMP_DIR.
+    # Otherwise fall back to TEMP_DIR (from config or mktemp via setup_temp_dir).
+    if [[ -n "${SPLIT_TEMP_DIR:-}" ]]; then
+        TEMP_DIR="${SPLIT_TEMP_DIR}"
     fi
-    TEMP_DIR="${SPLIT_TEMP_DIR}"
 
     # ---- Setup (order matters: temp dir must exist before logging) ----
     setup_temp_dir

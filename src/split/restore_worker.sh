@@ -159,12 +159,15 @@ EOF
         local dl_ok=false
 
         while (( dl_attempt <= dl_max )); do
+            log "DEBUG" "[RDL${worker_id}] Download attempt ${dl_attempt}/${dl_max}: ${partname}"
             rm -f "${local_part}"
             if SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                     -P "${SFTP_PORT}" \
                     -o StrictHostKeyChecking=no \
-                    -o BatchMode=no \
-                    -o ConnectTimeout=60 \
+                    -o BatchMode=yes \
+                    -o ConnectTimeout=5 \
+                    -o ServerAliveInterval=15 \
+                    -o ServerAliveCountMax=3 \
                     -o LogLevel=ERROR \
                     -b <(printf 'get %s %s\n' "${sftp_src}" "${local_part}") \
                     "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then

@@ -67,8 +67,10 @@ sftp_get_size() {
     raw_ls=$(SSHPASS="${SFTP_PASS}" sshpass -e sftp \
         -P "${SFTP_PORT}" \
         -o StrictHostKeyChecking=no \
-        -o BatchMode=no \
-        -o ConnectTimeout=15 \
+        -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=3 \
         -o LogLevel=ERROR \
         -b <(printf 'ls -l %s\n' "${remote_path}") \
         "${SFTP_USER}@${SFTP_HOST}" 2>/dev/null || true)
@@ -173,8 +175,10 @@ sftp_mkdir_p() {
     SSHPASS="${SFTP_PASS}" sshpass -e sftp \
         -P "${SFTP_PORT}" \
         -o StrictHostKeyChecking=no \
-        -o BatchMode=no \
-        -o ConnectTimeout=15 \
+        -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=3 \
         -o LogLevel=ERROR \
         -b <(printf '%s' "${batch_cmds}") \
         "${SFTP_USER}@${SFTP_HOST}" &>/dev/null || true
@@ -213,8 +217,10 @@ sftp_download_verify() {
     if ! SSHPASS="${SFTP_PASS}" sshpass -e sftp \
             -P "${SFTP_PORT}" \
             -o StrictHostKeyChecking=no \
-            -o BatchMode=no \
-            -o ConnectTimeout=30 \
+            -o BatchMode=yes \
+            -o ConnectTimeout=5 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
             -o LogLevel=ERROR \
             -b <(printf 'get %s %s\n' "${remote_path}" "${verify_file}") \
             "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
@@ -261,8 +267,10 @@ sftp_delete_file() {
     if SSHPASS="${SFTP_PASS}" sshpass -e sftp \
             -P "${SFTP_PORT}" \
             -o StrictHostKeyChecking=no \
-            -o BatchMode=no \
-            -o ConnectTimeout=15 \
+            -o BatchMode=yes \
+            -o ConnectTimeout=5 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
             -o LogLevel=ERROR \
             -b <(printf 'rm %s\n' "${remote_path}") \
             "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then

@@ -105,8 +105,10 @@ EOF
             if SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                     -P "${SFTP_PORT}" \
                     -o StrictHostKeyChecking=no \
-                    -o BatchMode=no \
-                    -o ConnectTimeout=30 \
+                    -o BatchMode=yes \
+                    -o ConnectTimeout=5 \
+                    -o ServerAliveInterval=15 \
+                    -o ServerAliveCountMax=3 \
                     -o LogLevel=ERROR \
                     -b <(printf 'get %s %s\n' "${sftp_dest}" "${verify_file}") \
                     "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
@@ -137,8 +139,10 @@ EOF
         if ! SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                 -P "${SFTP_PORT}" \
                 -o StrictHostKeyChecking=no \
-                -o BatchMode=no \
-                -o ConnectTimeout=60 \
+                -o BatchMode=yes \
+                -o ConnectTimeout=5 \
+                -o ServerAliveInterval=15 \
+                -o ServerAliveCountMax=3 \
                 -o LogLevel=ERROR \
                 -b <(printf 'put %s %s\n' "${local_part}" "${sftp_dest}") \
                 "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
@@ -212,8 +216,10 @@ EOF
             if SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                     -P "${SFTP_PORT}" \
                     -o StrictHostKeyChecking=no \
-                    -o BatchMode=no \
-                    -o ConnectTimeout=60 \
+                    -o BatchMode=yes \
+                    -o ConnectTimeout=5 \
+                    -o ServerAliveInterval=15 \
+                    -o ServerAliveCountMax=3 \
                     -o LogLevel=ERROR \
                     -b <(printf 'get %s %s\n' "${sftp_dest}" "${verify_file}") \
                     "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
@@ -250,8 +256,10 @@ EOF
             SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                 -P "${SFTP_PORT}" \
                 -o StrictHostKeyChecking=no \
-                -o BatchMode=no \
-                -o ConnectTimeout=15 \
+                -o BatchMode=yes \
+                -o ConnectTimeout=5 \
+                -o ServerAliveInterval=15 \
+                -o ServerAliveCountMax=3 \
                 -o LogLevel=ERROR \
                 -b <(printf 'rm %s\n' "${sftp_dest}") \
                 "${SFTP_USER}@${SFTP_HOST}" &>/dev/null || true
