@@ -91,6 +91,8 @@ split_parse_args() {
         split_usage
     fi
 
+    # SPLIT_CLI_NO_DELETE is read by split_main() in split_transfer.sh
+    # shellcheck disable=SC2034
     while getopts ":c:s:p:t:nvh" opt; do
         case "${opt}" in
             c) SPLIT_CLI_CONFIG="${OPTARG}" ;;
@@ -112,10 +114,16 @@ split_parse_args() {
         exit 1
     fi
 
-    # Propagate CLI overrides into the variables that load_config / split_config read
-    [[ -n "${SPLIT_CLI_CONFIG}" ]]   && DEFAULT_CONFIG="${SPLIT_CLI_CONFIG}"
-    [[ -n "${SPLIT_CLI_SIZE}" ]]     && SPLIT_SIZE="${SPLIT_CLI_SIZE}"
-    [[ -n "${SPLIT_CLI_WORKERS}" ]]  && SPLIT_PART_WORKERS="${SPLIT_CLI_WORKERS}"
-    [[ -n "${SPLIT_CLI_TEMP_DIR}" ]] && TEMP_DIR="${SPLIT_CLI_TEMP_DIR}"
+    # Propagate CLI overrides into the variables that load_config / split_config read.
+    # All target vars are consumed by other sourced modules — not unused.
+    # shellcheck disable=SC2034
+    [[ -n "${SPLIT_CLI_CONFIG}" ]]       && DEFAULT_CONFIG="${SPLIT_CLI_CONFIG}"
+    # shellcheck disable=SC2034
+    [[ -n "${SPLIT_CLI_SIZE}" ]]         && SPLIT_SIZE="${SPLIT_CLI_SIZE}"
+    # shellcheck disable=SC2034
+    [[ -n "${SPLIT_CLI_WORKERS}" ]]      && SPLIT_PART_WORKERS="${SPLIT_CLI_WORKERS}"
+    # shellcheck disable=SC2034
+    [[ -n "${SPLIT_CLI_TEMP_DIR}" ]]     && TEMP_DIR="${SPLIT_CLI_TEMP_DIR}"
+    # shellcheck disable=SC2034
     [[ "${SPLIT_CLI_VERBOSE}" == true ]] && CLI_VERBOSE=true
 }

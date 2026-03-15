@@ -85,7 +85,7 @@ EOF
 #   MANIFEST_ORIGINAL_SHA256
 #   MANIFEST_PART_SIZE_BYTES
 #   MANIFEST_PART_COUNT
-#   MANIFEST_PART_SUFFIX_LENGTH
+#   MANIFEST_PART_SUFFIX_LEN
 #   MANIFEST_PART_PREFIX
 #   MANIFEST_SPLIT_DATE
 #   MANIFEST_SFTP_PARTS_DIR
@@ -93,6 +93,13 @@ EOF
 # Per-part data is stored in two associative arrays:
 #   MANIFEST_PART_SHA256[partname]=<hex>
 #   MANIFEST_PART_SIZE[partname]=<bytes>
+#
+# Declared at global scope here so that forked worker subprocesses (spawned
+# with & after read_manifest() runs in the parent) inherit the populated
+# arrays.  declare -gA inside a function is NOT inherited by subprocesses.
+declare -A MANIFEST_PART_SHA256=()
+declare -A MANIFEST_PART_SIZE=()
+
 read_manifest() {
     local manifest_file="$1"
 
@@ -101,9 +108,9 @@ read_manifest() {
         return 1
     fi
 
-    # Declare associative arrays for per-part data
-    declare -gA MANIFEST_PART_SHA256=()
-    declare -gA MANIFEST_PART_SIZE=()
+    # Reset the global per-part arrays before re-populating
+    MANIFEST_PART_SHA256=()
+    MANIFEST_PART_SIZE=()
 
     local in_parts_section=false
 
@@ -124,6 +131,8 @@ read_manifest() {
             local key value
             key="${line%%=*}"
             value="${line#*=}"
+            # MANIFEST_SPLIT_DATE is informational only — not read by any function
+            # shellcheck disable=SC2034
             case "${key}" in
                 original_ftp_path)   MANIFEST_ORIGINAL_FTP_PATH="${value}" ;;
                 original_filename)   MANIFEST_ORIGINAL_FILENAME="${value}" ;;
@@ -131,7 +140,7 @@ read_manifest() {
                 original_sha256)     MANIFEST_ORIGINAL_SHA256="${value}" ;;
                 part_size_bytes)     MANIFEST_PART_SIZE_BYTES="${value}" ;;
                 part_count)          MANIFEST_PART_COUNT="${value}" ;;
-                part_suffix_length)  MANIFEST_PART_SUFFIX_LENGTH="${value}" ;;
+                part_suffix_length)  MANIFEST_PART_SUFFIX_LEN="${value}" ;;
                 part_prefix)         MANIFEST_PART_PREFIX="${value}" ;;
                 split_date)          MANIFEST_SPLIT_DATE="${value}" ;;
                 sftp_parts_dir)      MANIFEST_SFTP_PARTS_DIR="${value}" ;;

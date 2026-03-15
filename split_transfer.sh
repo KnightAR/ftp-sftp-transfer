@@ -322,11 +322,10 @@ split_run_upload_workers() {
 # Prints the final summary for a split transfer run.
 # ============================================================
 split_print_summary() {
-    local original_file="$1"
-    local original_size="$2"
-    local original_hash="$3"
-    local part_count="$4"
-    local sftp_manifest_path="$5"
+    local original_size="$1"
+    local original_hash="$2"
+    local part_count="$3"
+    local sftp_manifest_path="$4"
 
     log "INFO" "============================================================"
     log "INFO" "Split Transfer Summary"
@@ -482,7 +481,7 @@ print(int(s))
         log "ERROR" "Split transfer completed with failures — ${SPLIT_CNT_FAILED} failed, ${SPLIT_CNT_ERRORS} errors"
         log "ERROR" "Re-run split_transfer.sh with the same arguments to resume"
         split_print_summary \
-            "${local_file}" "${original_size}" "${original_sha256}" \
+            "${original_size}" "${original_sha256}" \
             "${SPLIT_PART_COUNT}" "${sftp_manifest_path}"
         exit 1
     fi
@@ -496,7 +495,7 @@ print(int(s))
 
     # ---- Summary ----
     split_print_summary \
-        "${local_file}" "${original_size}" "${original_sha256}" \
+        "${original_size}" "${original_sha256}" \
         "${SPLIT_PART_COUNT}" "${sftp_manifest_path}"
 
     log "INFO" "split_transfer.sh complete — all ${SPLIT_PART_COUNT} parts uploaded and verified"

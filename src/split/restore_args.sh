@@ -120,9 +120,14 @@ restore_parse_args() {
         exit 1
     fi
 
-    # Propagate CLI overrides into the variables that load_config / split_config read
-    [[ -n "${RESTORE_CLI_CONFIG}" ]]   && DEFAULT_CONFIG="${RESTORE_CLI_CONFIG}"
-    [[ -n "${RESTORE_CLI_WORKERS}" ]]  && SPLIT_RESTORE_WORKERS="${RESTORE_CLI_WORKERS}"
-    [[ -n "${RESTORE_CLI_TEMP_DIR}" ]] && TEMP_DIR="${RESTORE_CLI_TEMP_DIR}"
-    [[ "${RESTORE_CLI_VERBOSE}" == true ]] && CLI_VERBOSE=true
+    # Propagate CLI overrides into the variables that load_config / split_config read.
+    # All target vars are consumed by other sourced modules — not unused.
+    # shellcheck disable=SC2034
+    [[ -n "${RESTORE_CLI_CONFIG}" ]]        && DEFAULT_CONFIG="${RESTORE_CLI_CONFIG}"
+    # shellcheck disable=SC2034
+    [[ -n "${RESTORE_CLI_WORKERS}" ]]       && SPLIT_RESTORE_WORKERS="${RESTORE_CLI_WORKERS}"
+    # shellcheck disable=SC2034
+    [[ -n "${RESTORE_CLI_TEMP_DIR}" ]]      && TEMP_DIR="${RESTORE_CLI_TEMP_DIR}"
+    # shellcheck disable=SC2034
+    [[ "${RESTORE_CLI_VERBOSE}" == true ]]  && CLI_VERBOSE=true
 }
