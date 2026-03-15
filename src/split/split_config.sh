@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# ============================================================
+# src/split/split_config.sh — Split Transfer Configuration Defaults
+#
+# Defines default values for all split-specific configuration
+# variables.  These are applied after the main transfer.conf is
+# sourced by load_config(), using the same ":=" default pattern
+# so any value already set in transfer.conf takes precedence.
+#
+# Variables defined here:
+#   SPLIT_SIZE          — part size passed to "split -b".  Accepts
+#                         any suffix that split understands: k, m, g,
+#                         K, M, G.  Default: 1g (1 GiB).
+#   SPLIT_PART_WORKERS  — number of parallel SFTP upload workers for
+#                         part uploads.  Defaults to SFTP_MAX_WORKERS
+#                         from the main config so no extra setting is
+#                         needed in transfer.conf.
+#   SPLIT_RESTORE_WORKERS — number of parallel SFTP download workers
+#                         used by split_restore.sh.  Also defaults to
+#                         SFTP_MAX_WORKERS.
+#   SPLIT_SUFFIX_LENGTH — digit width for part suffixes (e.g. 5 gives
+#                         .part.00001).  Default: 5 (supports up to
+#                         99,999 parts — handles files up to ~100 TB
+#                         at 1 GiB part size).
+#   SPLIT_PARTS_SUBDIR  — name of the subdirectory created under the
+#                         original file's parent directory on SFTP to
+#                         hold the part files.  Default: "split".
+#
+# Dependency order:
+#   Must be called from within load_config() or after it, so that
+#   SFTP_MAX_WORKERS is already set from transfer.conf.
+# ============================================================
+
+apply_split_defaults() {
+    # Part size — any suffix accepted by GNU split -b (k/m/g/K/M/G)
+    : "${SPLIT_SIZE:=1g}"
+
+    # Parallel workers for part uploads / downloads.
+    # Fall back to SFTP_MAX_WORKERS so the operator only needs one setting.
+    : "${SPLIT_PART_WORKERS:=${SFTP_MAX_WORKERS:-10}}"
+    : "${SPLIT_RESTORE_WORKERS:=${SFTP_MAX_WORKERS:-10}}"
+
+    # Suffix digit width — 5 digits = up to 99,999 parts
+    : "${SPLIT_SUFFIX_LENGTH:=5}"
+
+    # Subdirectory name under the original file's parent on SFTP
+    : "${SPLIT_PARTS_SUBDIR:=split}"
+}
+
+validate_split_config() {
+    local errors=0
+
+    # Validate SPLIT_SIZE — must be a number followed by an optional valid suffix
+    if ! [[ "${SPLIT_SIZE}" =~ ^[0-9]+[kKmMgG]?$ ]]; then
+        echo "ERROR: SPLIT_SIZE must be a number with optional suffix k/m/g (got: '${SPLIT_SIZE}')" >&2
+        (( errors++ )) || true
+    fi
+
+    # Validate SPLIT_PART_WORKERS — must be a positive integer
+    if ! [[ "${SPLIT_PART_WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: SPLIT_PART_WORKERS must be a positive integer (got: '${SPLIT_PART_WORKERS}')" >&2
+        (( errors++ )) || true
+    fi
+
+    # Validate SPLIT_RESTORE_WORKERS — must be a positive integer
+    if ! [[ "${SPLIT_RESTORE_WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: SPLIT_RESTORE_WORKERS must be a positive integer (got: '${SPLIT_RESTORE_WORKERS}')" >&2
+        (( errors++ )) || true
+    fi
+
+    # Validate SPLIT_SUFFIX_LENGTH — must be a positive integer between 1 and 10
+    if ! [[ "${SPLIT_SUFFIX_LENGTH}" =~ ^[1-9][0-9]*$ ]] || (( SPLIT_SUFFIX_LENGTH > 10 )); then
+        echo "ERROR: SPLIT_SUFFIX_LENGTH must be an integer 1-10 (got: '${SPLIT_SUFFIX_LENGTH}')" >&2
+        (( errors++ )) || true
+    fi
+
+    # Validate SPLIT_PARTS_SUBDIR — must be a simple directory name (no slashes)
+    if [[ -z "${SPLIT_PARTS_SUBDIR}" ]] || [[ "${SPLIT_PARTS_SUBDIR}" == */* ]]; then
+        echo "ERROR: SPLIT_PARTS_SUBDIR must be a simple directory name with no slashes (got: '${SPLIT_PARTS_SUBDIR}')" >&2
+        (( errors++ )) || true
+    fi
+
+    if (( errors > 0 )); then
+        echo "ERROR: ${errors} split configuration error(s) found." >&2
+        exit 1
+    fi
+}
