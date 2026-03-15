@@ -121,11 +121,13 @@ restore_download_manifest() {
 }
 
 # ============================================================
-# restore_build_queue PARTS_STAGING_DIR
-# Reads MANIFEST_PART_PREFIX + MANIFEST_PART_COUNT + MANIFEST_PART_SUFFIX_LEN
-# to generate the ordered list of part filenames and writes them to
-# TEMP_DIR/restore_part_queue.txt (one per line, in numeric order).
-# Also creates the restore_status directory.
+# restore_build_queue
+# Reads the MANIFEST_PART_SIZE associative array (populated by read_manifest())
+# to build the ordered list of part filenames and writes them to
+# TEMP_DIR/restore_part_queue.txt (one per line, sorted numerically).
+# Using the manifest array keys guarantees the queue exactly matches what was
+# recorded at split time — no counter arithmetic, no off-by-one risk.
+# Also creates the restore_status and workers directories.
 # ============================================================
 restore_build_queue() {
     local queue_file="${TEMP_DIR}/restore_part_queue.txt"
@@ -134,16 +136,17 @@ restore_build_queue() {
     mkdir -p "${TEMP_DIR}/restore_status"
     mkdir -p "${TEMP_DIR}/workers"
 
-    local i partname
-    for (( i=1; i<=MANIFEST_PART_COUNT; i++ )); do
-        partname=$(printf '%s%0*d' \
-            "${MANIFEST_PART_PREFIX}" \
-            "${MANIFEST_PART_SUFFIX_LEN}" \
-            "${i}")
+    # Build queue directly from the manifest's [parts] section.
+    # MANIFEST_PART_SIZE keys are the authoritative part names in the exact
+    # format they were written — sorted numerically to guarantee reassembly order.
+    local partname
+    local queued=0
+    for partname in $(echo "${!MANIFEST_PART_SIZE[@]}" | tr ' ' '\n' | sort); do
         echo "${partname}" >> "${queue_file}"
+        (( queued++ )) || true
     done
 
-    log "INFO" "Download queue built: ${MANIFEST_PART_COUNT} parts"
+    log "INFO" "Download queue built: ${queued} parts"
 }
 
 # ============================================================
