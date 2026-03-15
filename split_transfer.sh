@@ -407,11 +407,17 @@ print(int(s))
     local local_manifest="${staging_dir}/${filename}.manifest"
 
     # SFTP destination paths
-    # Manifest sits in the same dir as the original FTP file would be
+    # Manifest sits in the same dir as the original FTP file would be.
     # Parts go into a "split" subdirectory under that.
-    # Strip a trailing slash from ftp_dir (happens when ftp_path is /file.tar
-    # and dirname returns "/") to avoid double-slash paths like //file.manifest.
-    local sftp_base_dir="${ftp_dir%/}"
+    #
+    # SFTP_REMOTE_DIR has no trailing slash (config convention, same as
+    # transfer.sh / download_worker.sh which uses ${SFTP_REMOTE_DIR}${ftp_path}
+    # where ftp_path always starts with "/").
+    #
+    # ftp_dir is the dirname of the FTP path.  For a root-level file like
+    # /blockchain.tar.xz, dirname returns "/" — strip that trailing slash so
+    # the concatenation is "bucket" + "" + "/file.manifest" not "bucket//file".
+    local sftp_base_dir="${SFTP_REMOTE_DIR}${ftp_dir%/}"
     local sftp_manifest_path="${sftp_base_dir}/${filename}.manifest"
     local sftp_parts_dir="${sftp_base_dir}/${SPLIT_PARTS_SUBDIR}"
 
