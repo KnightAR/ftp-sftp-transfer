@@ -161,7 +161,7 @@ EOF
         while (( dl_attempt <= dl_max )); do
             log "DEBUG" "[RDL${worker_id}] Download attempt ${dl_attempt}/${dl_max}: ${partname}"
             rm -f "${local_part}"
-            if SSHPASS="${SFTP_PASS}" sshpass -e sftp \
+            if ! SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                     -P "${SFTP_PORT}" \
                     -o StrictHostKeyChecking=no \
                     -o BatchMode=yes \
@@ -171,30 +171,37 @@ EOF
                     -o LogLevel=ERROR \
                     -b <(printf 'get %s %s\n' "${sftp_src}" "${local_part}") \
                     "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
-                dl_ok=true
-                break
+                rm -f "${local_part}"
+                if (( dl_attempt < dl_max )); then
+                    log "WARN" "[RDL${worker_id}] Download attempt ${dl_attempt}/${dl_max} failed (sftp error) — retrying in ${dl_sleep}s: ${partname}"
+                    sleep "${dl_sleep}"
+                fi
+                (( dl_attempt++ )) || true
+                continue
             fi
-            rm -f "${local_part}"
-            if (( dl_attempt < dl_max )); then
-                log "WARN" "[RDL${worker_id}] Download attempt ${dl_attempt}/${dl_max} failed — retrying in ${dl_sleep}s: ${partname}"
-                sleep "${dl_sleep}"
+
+            # sftp exited 0 — verify the downloaded size matches the manifest.
+            # A truncated remote file can cause sftp to exit 0 with a short file.
+            local actual_size
+            actual_size=$(stat -c '%s' "${local_part}" 2>/dev/null || echo 0)
+            if [[ "${actual_size}" != "${expected_size}" ]]; then
+                rm -f "${local_part}"
+                if (( dl_attempt < dl_max )); then
+                    log "WARN" "[RDL${worker_id}] Download attempt ${dl_attempt}/${dl_max} yielded wrong size (expected=${expected_size}, got=${actual_size}) — retrying in ${dl_sleep}s: ${partname}"
+                    sleep "${dl_sleep}"
+                else
+                    log "ERROR" "[RDL${worker_id}] Download attempt ${dl_attempt}/${dl_max} yielded wrong size (expected=${expected_size}, got=${actual_size}) — no more retries: ${partname}"
+                fi
+                (( dl_attempt++ )) || true
+                continue
             fi
-            (( dl_attempt++ )) || true
+
+            dl_ok=true
+            break
         done
 
         if [[ "${dl_ok}" != true ]]; then
             log "ERROR" "[RDL${worker_id}] SFTP download failed after ${dl_max} attempts: ${partname}"
-            rm -f "${local_part}"
-            echo "FAILED" > "${status_file}"
-            _inc_result "${result_file}" "ERRORS"
-            continue
-        fi
-
-        # ---- Verify size ----
-        local actual_size
-        actual_size=$(stat -c '%s' "${local_part}" 2>/dev/null || echo 0)
-        if [[ "${actual_size}" != "${expected_size}" ]]; then
-            log "ERROR" "[RDL${worker_id}] Part size mismatch after download (expected=${expected_size}, got=${actual_size}): ${partname}"
             rm -f "${local_part}"
             echo "FAILED" > "${status_file}"
             _inc_result "${result_file}" "ERRORS"
