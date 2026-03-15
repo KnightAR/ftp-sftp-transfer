@@ -331,14 +331,14 @@ split_main() {
     validate_split_config
 
     # Override split settings from CLI flags if provided
-    [[ -n "${SPLIT_CLI_SIZE}"    ]] && SPLIT_SIZE="${SPLIT_CLI_SIZE}"
-    [[ -n "${SPLIT_CLI_WORKERS}" ]] && SPLIT_PART_WORKERS="${SPLIT_CLI_WORKERS}"
-    [[ -n "${SPLIT_CLI_TEMP}"    ]] && TEMP_DIR="${SPLIT_CLI_TEMP}"
+    [[ -n "${SPLIT_CLI_SIZE}"     ]] && SPLIT_SIZE="${SPLIT_CLI_SIZE}"
+    [[ -n "${SPLIT_CLI_WORKERS}"  ]] && SPLIT_PART_WORKERS="${SPLIT_CLI_WORKERS}"
+    [[ -n "${SPLIT_CLI_TEMP_DIR}" ]] && TEMP_DIR="${SPLIT_CLI_TEMP_DIR}"
 
-    # ---- Setup ----
+    # ---- Setup (order matters: temp dir must exist before logging) ----
+    setup_temp_dir
     setup_logging
     acquire_lock
-    setup_temp_dir
     split_check_dependencies
 
     log "INFO" "split_transfer.sh ${SCRIPT_VERSION} starting"

@@ -253,16 +253,16 @@ restore_main() {
     validate_split_config
 
     # Override settings from CLI flags if provided
-    [[ -n "${RESTORE_CLI_WORKERS}" ]] && SPLIT_RESTORE_WORKERS="${RESTORE_CLI_WORKERS}"
-    [[ -n "${RESTORE_CLI_TEMP}"    ]] && TEMP_DIR="${RESTORE_CLI_TEMP}"
+    [[ -n "${RESTORE_CLI_WORKERS}"  ]] && SPLIT_RESTORE_WORKERS="${RESTORE_CLI_WORKERS}"
+    [[ -n "${RESTORE_CLI_TEMP_DIR}" ]] && TEMP_DIR="${RESTORE_CLI_TEMP_DIR}"
 
     # Set verify-only mode from CLI flag
-    RESTORE_VERIFY_ONLY="${RESTORE_CLI_VERIFY_ONLY:-false}"
+    RESTORE_VERIFY_ONLY="${RESTORE_CLI_VERIFY:-false}"
 
-    # ---- Setup ----
+    # ---- Setup (order matters: temp dir must exist before logging) ----
+    setup_temp_dir
     setup_logging
     acquire_lock
-    setup_temp_dir
     restore_check_dependencies
 
     log "INFO" "split_restore.sh ${SCRIPT_VERSION} starting"
