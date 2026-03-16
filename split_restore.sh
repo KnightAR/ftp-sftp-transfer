@@ -255,6 +255,9 @@ restore_main() {
     # ---- Parse CLI args ----
     restore_parse_args "$@"
 
+    # ---- Resolve config file (split.transfer.conf → transfer.conf) ----
+    resolve_split_config
+
     # ---- Load and validate config ----
     # "sftp-only" skips FTP credential validation — restore only needs SFTP.
     load_config "${RESTORE_CLI_CONFIG}" "sftp-only"

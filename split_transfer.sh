@@ -358,6 +358,9 @@ split_main() {
     # ---- Parse CLI args ----
     split_parse_args "$@"
 
+    # ---- Resolve config file (split.transfer.conf → transfer.conf) ----
+    resolve_split_config
+
     # ---- Load and validate config ----
     load_config "${SPLIT_CLI_CONFIG}"
     apply_split_defaults

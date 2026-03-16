@@ -91,6 +91,34 @@ apply_split_defaults() {
     : "${VERIFY_ARCHIVE_INTEGRITY:=true}"
 }
 
+# resolve_split_config
+# Sets DEFAULT_CONFIG for split scripts using this priority order:
+#   1. -c CLI override (already in CLI_CONFIG — load_config() handles this)
+#   2. split.transfer.conf in SCRIPT_DIR (if it exists)
+#   3. transfer.conf in SCRIPT_DIR (standard fallback)
+#
+# Must be called before load_config() so DEFAULT_CONFIG is set correctly.
+resolve_split_config() {
+    local split_conf="${SCRIPT_DIR}/split.transfer.conf"
+    local base_conf="${SCRIPT_DIR}/transfer.conf"
+
+    # DEFAULT_CONFIG is read by load_config() in config.sh — not unused.
+    # Note: logging not yet set up at this point — use echo for visibility.
+    if [[ -f "${split_conf}" ]]; then
+        # shellcheck disable=SC2034
+        DEFAULT_CONFIG="${split_conf}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG]  Using split config: ${split_conf}" >&2
+    elif [[ -f "${base_conf}" ]]; then
+        # shellcheck disable=SC2034
+        DEFAULT_CONFIG="${base_conf}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG]  split.transfer.conf not found — using: ${base_conf}" >&2
+    else
+        # Neither exists — let load_config() emit the standard error
+        # shellcheck disable=SC2034
+        DEFAULT_CONFIG="${base_conf}"
+    fi
+}
+
 validate_split_config() {
     local errors=0
 
