@@ -70,7 +70,6 @@ source "${SCRIPT_DIR}/src/system/lock.sh"
 source "${SCRIPT_DIR}/src/system/temp.sh"
 source "${SCRIPT_DIR}/src/system/trap.sh"
 source "${SCRIPT_DIR}/src/transfer/sftp.sh"
-source "${SCRIPT_DIR}/src/transfer/archive_verify.sh"
 source "${SCRIPT_DIR}/src/workers/counters.sh"
 source "${SCRIPT_DIR}/src/split/split_config.sh"
 source "${SCRIPT_DIR}/src/split/split_upload_args.sh"
@@ -246,15 +245,6 @@ print(n * mult)
     else
         # ---- FULL / PARTIAL MODE ----
         # In both cases the source file is read in-place from its original path.
-
-        # ---- Step 3: Archive integrity check ----
-        local arc_rc=0
-        verify_archive_integrity "${source_file}" || arc_rc=$?
-        if (( arc_rc == 1 )); then
-            log "ERROR" "Archive integrity check failed — aborting: ${source_file}"
-            exit 1
-        fi
-        # arc_rc=2 means not a known archive format — continue as plain file
 
         original_size=$(stat -c '%s' "${source_file}")
 
