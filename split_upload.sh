@@ -139,6 +139,8 @@ split_upload_main() {
 
     # ---- Load config ----
     load_config "" "sftp_only"
+    apply_split_defaults
+    validate_split_config
 
     # ---- Apply CLI overrides ----
     [[ -n "${UPLOAD_CLI_WORKERS:-}"  ]] && SPLIT_PART_WORKERS="${UPLOAD_CLI_WORKERS}"
@@ -155,7 +157,6 @@ split_upload_main() {
     setup_logging
     acquire_lock
     split_upload_check_dependencies
-    validate_split_config
 
     # ---- Validate source file ----
     local source_file="${UPLOAD_CLI_SOURCE_FILE}"
