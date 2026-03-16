@@ -75,6 +75,7 @@ source "${SCRIPT_DIR}/src/split/split_config.sh"
 source "${SCRIPT_DIR}/src/split/split_upload_args.sh"
 source "${SCRIPT_DIR}/src/split/split_manifest.sh"
 source "${SCRIPT_DIR}/src/split/split_worker.sh"
+source "${SCRIPT_DIR}/src/split/split_ops.sh"
 
 # ============================================================
 # split_upload_check_dependencies
