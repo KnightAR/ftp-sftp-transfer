@@ -392,25 +392,29 @@ delete_dirs_from_tar() {
 
 # ============================================================
 # compress_tar_to_xz
-# Compresses STAGING_TAR to STAGING_XZ via xz pipeline.
+# Repacks STAGING_TAR through a clean tar stream to reclaim
+# blocks left behind by tar --delete, then compresses to
+# STAGING_XZ. Uses tar @archive syntax to re-emit a clean
+# entry stream without writing a second .tar to disk.
+# Always repacks — guarantees clean output in all modes.
 # ============================================================
 compress_tar_to_xz() {
     local xz_opts
     xz_opts=$(build_xz_opts)
 
-    log "INFO" "Compressing: ${STAGING_TAR} → ${STAGING_XZ}"
+    log "INFO" "Repacking and compressing: ${STAGING_TAR} → ${STAGING_XZ}"
 
     local rc=0
 
     # shellcheck disable=SC2086
     if [[ "${HAS_PV}" == true ]]; then
-        pv "${STAGING_TAR}" | xz ${xz_opts} > "${STAGING_XZ}" || rc=$?
+        tar -c -f - "@${STAGING_TAR}" | pv | xz ${xz_opts} > "${STAGING_XZ}" || rc=$?
     else
-        xz ${xz_opts} < "${STAGING_TAR}" > "${STAGING_XZ}" || rc=$?
+        tar -c -f - "@${STAGING_TAR}" | xz ${xz_opts} > "${STAGING_XZ}" || rc=$?
     fi
 
     if (( rc != 0 )); then
-        log "ERROR" "XZ compression failed (rc=${rc})"
+        log "ERROR" "Repack/compression failed (rc=${rc})"
         return 1
     fi
 
