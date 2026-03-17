@@ -21,6 +21,7 @@ HAS_UNZIP=false
 HAS_7Z=false
 HAS_PV=false
 HAS_TAR=false
+HAS_BSDTAR=false
 
 # ============================================================
 # log LEVEL MESSAGE
@@ -74,13 +75,14 @@ detect_tools() {
     command -v 7z     &>/dev/null && HAS_7Z=true
     command -v pv     &>/dev/null && HAS_PV=true
     command -v tar    &>/dev/null && HAS_TAR=true
+    command -v bsdtar &>/dev/null && HAS_BSDTAR=true
 
     if ! command -v xz &>/dev/null; then
         echo "ERROR: xz is required but not found." >&2
         exit 2
     fi
 
-    log "DEBUG" "Tools: pbzip2=${HAS_PBZIP2} bzip2=${HAS_BZIP2} gzip=${HAS_GZIP} unzip=${HAS_UNZIP} 7z=${HAS_7Z} pv=${HAS_PV} tar=${HAS_TAR}"
+    log "DEBUG" "Tools: pbzip2=${HAS_PBZIP2} bzip2=${HAS_BZIP2} gzip=${HAS_GZIP} unzip=${HAS_UNZIP} 7z=${HAS_7Z} pv=${HAS_PV} tar=${HAS_TAR} bsdtar=${HAS_BSDTAR}"
 }
 
 # ============================================================

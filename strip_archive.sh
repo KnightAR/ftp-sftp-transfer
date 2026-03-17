@@ -11,6 +11,9 @@
 # decompression is skipped. Use -C to skip tar --delete entirely
 # and go straight to recompression.
 #
+# Requires bsdtar (libarchive-tools) for clean block reclamation
+# after tar --delete. Install with: apt-get install libarchive-tools
+#
 # Usage:
 #   ./strip_archive.sh <archive> [dirs] [OPTIONS]
 #
@@ -392,10 +395,10 @@ delete_dirs_from_tar() {
 
 # ============================================================
 # compress_tar_to_xz
-# Repacks STAGING_TAR through a clean tar stream to reclaim
-# blocks left behind by tar --delete, then compresses to
-# STAGING_XZ. Uses tar @archive syntax to re-emit a clean
-# entry stream without writing a second .tar to disk.
+# Repacks STAGING_TAR through bsdtar to reclaim dead blocks
+# left behind by tar --delete, then pipes clean stream to xz.
+# bsdtar's @archive syntax re-emits only live entries without
+# writing a second .tar to disk.
 # Always repacks — guarantees clean output in all modes.
 # ============================================================
 compress_tar_to_xz() {
@@ -408,9 +411,9 @@ compress_tar_to_xz() {
 
     # shellcheck disable=SC2086
     if [[ "${HAS_PV}" == true ]]; then
-        tar -c -f - "@${STAGING_TAR}" | pv | xz ${xz_opts} > "${STAGING_XZ}" || rc=$?
+        bsdtar -cf - "@${STAGING_TAR}" | pv | xz ${xz_opts} > "${STAGING_XZ}" || rc=$?
     else
-        tar -c -f - "@${STAGING_TAR}" | xz ${xz_opts} > "${STAGING_XZ}" || rc=$?
+        bsdtar -cf - "@${STAGING_TAR}" | xz ${xz_opts} > "${STAGING_XZ}" || rc=$?
     fi
 
     if (( rc != 0 )); then
@@ -435,6 +438,13 @@ main() {
     # ---- Require tar for --delete ----
     if [[ "${HAS_TAR}" != true ]]; then
         echo "ERROR: tar is required but not found." >&2
+        exit 2
+    fi
+
+    # ---- Require bsdtar for clean block reclamation after tar --delete ----
+    if [[ "${HAS_BSDTAR}" != true ]]; then
+        echo "ERROR: bsdtar is required but not found." >&2
+        echo "       Install with: apt-get install libarchive-tools" >&2
         exit 2
     fi
 
