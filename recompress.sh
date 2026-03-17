@@ -28,9 +28,13 @@
 #   -h          Help
 # ============================================================
 
+# shellcheck disable=SC2034  # OPT_VERBOSE, OPT_CONFIG used by compress_utils.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=src/compress/compress_utils.sh
+source "${SCRIPT_DIR}/src/compress/compress_utils.sh"
 
 # ---- Defaults ----
 OPT_CLOBBER=false
@@ -40,26 +44,19 @@ OPT_TAR_MULTI=false
 OPT_XZ_LEVEL=9
 OPT_XZ_EXTREME=true
 OPT_XZ_THREADS=32
+# shellcheck disable=SC2034  # used by compress_utils.sh
 OPT_VERBOSE=false
+# shellcheck disable=SC2034  # used by compress_utils.sh
 OPT_CONFIG="${SCRIPT_DIR}/transfer.conf"
 OPT_PATH=""
 
 # ---- Counters ----
+# (Tool flags and shared functions provided by compress_utils.sh)
 CNT_RECOMPRESSED=0
 CNT_SKIPPED_FORMAT=0
 CNT_SKIPPED_MULTI=0
 CNT_SKIPPED_CLOBBER=0
 CNT_FAILED=0
-
-# ---- Logging ----
-log() {
-    local level="$1"
-    local msg="$2"
-    if [[ "${level}" == "DEBUG" ]] && [[ "${OPT_VERBOSE}" != true ]]; then
-        return 0
-    fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${level}]  ${msg}" >&2
-}
 
 usage() {
     cat <<EOF
@@ -161,76 +158,6 @@ parse_args() {
         echo "ERROR: Path not found: ${OPT_PATH}" >&2
         exit 2
     fi
-}
-
-# ============================================================
-# load_temp_dir
-# Sources transfer.conf (or -c override) to get TEMP_DIR.
-# Falls back to mktemp if TEMP_DIR not set.
-# ============================================================
-load_temp_dir() {
-    TEMP_DIR=""
-
-    if [[ -f "${OPT_CONFIG}" ]]; then
-        # Source only — extract TEMP_DIR value
-        # shellcheck disable=SC1090
-        source "${OPT_CONFIG}" 2>/dev/null || true
-        log "DEBUG" "Loaded config: ${OPT_CONFIG}"
-    else
-        log "WARN" "Config file not found: ${OPT_CONFIG} — will use mktemp"
-    fi
-
-    if [[ -z "${TEMP_DIR:-}" ]]; then
-        TEMP_DIR=$(mktemp -d -t recompress_XXXXXXXXXX)
-        log "WARN" "TEMP_DIR not set in config — using mktemp: ${TEMP_DIR}"
-        # Register cleanup so the mktemp dir is removed on exit
-        trap 'rm -rf "${TEMP_DIR}"' EXIT
-    else
-        log "DEBUG" "Using TEMP_DIR from config: ${TEMP_DIR}"
-    fi
-
-    mkdir -p "${TEMP_DIR}"
-}
-
-# ============================================================
-# detect_tools
-# Builds capability flags for available decompression tools.
-# ============================================================
-HAS_PBZIP2=false
-HAS_BZIP2=false
-HAS_GZIP=false
-HAS_UNZIP=false
-HAS_7Z=false
-HAS_PV=false
-HAS_TAR=false
-
-detect_tools() {
-    command -v pbzip2 &>/dev/null && HAS_PBZIP2=true
-    command -v bzip2  &>/dev/null && HAS_BZIP2=true
-    command -v gzip   &>/dev/null && HAS_GZIP=true
-    command -v unzip  &>/dev/null && HAS_UNZIP=true
-    command -v 7z     &>/dev/null && HAS_7Z=true
-    command -v pv     &>/dev/null && HAS_PV=true
-    command -v tar    &>/dev/null && HAS_TAR=true
-
-    if ! command -v xz &>/dev/null; then
-        echo "ERROR: xz is required but not found." >&2
-        exit 2
-    fi
-
-    log "DEBUG" "Tools: pbzip2=${HAS_PBZIP2} bzip2=${HAS_BZIP2} gzip=${HAS_GZIP} unzip=${HAS_UNZIP} 7z=${HAS_7Z} pv=${HAS_PV} tar=${HAS_TAR}"
-}
-
-# ============================================================
-# build_xz_cmd
-# Prints the xz command as an array (via nameref or echo).
-# ============================================================
-build_xz_opts() {
-    local opts="-${OPT_XZ_LEVEL}"
-    [[ "${OPT_XZ_EXTREME}" == true ]] && opts="${opts} --extreme"
-    opts="${opts} -z -T ${OPT_XZ_THREADS} -c"
-    [[ "${OPT_VERBOSE}" == true ]] && opts="${opts} -v"
-    echo "${opts}"
 }
 
 # ============================================================
