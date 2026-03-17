@@ -482,7 +482,9 @@ main() {
     # ---- Step 2: Delete directories (skip if -C) ----
     if [[ "${OPT_CONTINUE}" != true ]] && (( ${#dir_list[@]} > 0 )); then
         if ! delete_dirs_from_tar "${dir_list[@]}"; then
-            cleanup_staging
+            # Preserve staging tar so the user can correct paths and resume
+            log "INFO" "Staging tar preserved for resume: ${STAGING_TAR}"
+            log "INFO" "Correct the path(s) above and re-run the same command to resume."
             exit 1
         fi
     else
