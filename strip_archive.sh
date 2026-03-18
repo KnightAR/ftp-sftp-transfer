@@ -358,37 +358,45 @@ decompress_to_tar() {
 
 # ============================================================
 # delete_dirs_from_tar DIR_ARRAY...
-# Runs tar --delete for each dir.
-# Fresh run: missing path is fatal.
+# Runs tar --delete for each dir, completing the full loop
+# before exiting so all failures are reported in one pass.
+# Fresh run: missing path is a fatal error (collected).
 # Resume run: missing path is INFO (may already be deleted).
-# Other tar errors are always fatal.
+# Other tar errors are always fatal (collected).
+# Returns 1 if any errors were recorded, 0 if all succeeded.
 # ============================================================
 delete_dirs_from_tar() {
     local dirs=("$@")
 
     local dir rc tar_stderr
+    local had_error=false
+
     for dir in "${dirs[@]}"; do
         log "INFO" "Deleting from tar: ${dir}"
         rc=0
         tar_stderr=$(tar --delete -f "${STAGING_TAR}" "${dir}" 2>&1) || rc=$?
 
         if (( rc == 0 )); then
-            log "DEBUG" "Deleted: ${dir}"
+            log "INFO" "Deleted: ${dir}"
         else
             if echo "${tar_stderr}" | grep -q "Not found in archive"; then
                 if [[ "${RESUME_MODE}" == true ]]; then
                     log "INFO" "Not found in archive (may already be deleted on previous run): ${dir}"
                 else
                     log "ERROR" "Path not found in archive — correct the path and re-run: ${dir}"
-                    return 1
+                    had_error=true
                 fi
             else
                 log "ERROR" "tar --delete failed (rc=${rc}): ${dir}"
                 [[ -n "${tar_stderr}" ]] && log "ERROR" "tar output: ${tar_stderr}"
-                return 1
+                had_error=true
             fi
         fi
     done
+
+    if [[ "${had_error}" == true ]]; then
+        return 1
+    fi
 
     return 0
 }
