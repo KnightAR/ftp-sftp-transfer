@@ -49,6 +49,7 @@ Options:
   -p PASS    Password for FTP/SFTP sources
   -t DIR     Staging temp directory         (default: auto mktemp)
   -j N       Parallel download workers      (default: 4)
+  -T N       zpaqfranz thread count         (default: 25% of nproc, max 8)
   -v         Verbose / DEBUG output
   -h         Show help
 
@@ -147,6 +148,7 @@ Options:
   -c FILE    Config file                         (default: ./transfer.conf)
   -k N       Timestamped backups to keep         (default: 7)
   -t DIR     Temp dir for verification downloads (default: auto mktemp)
+  -T N       zpaqfranz thread count              (default: 25% of nproc, max 8)
   -f         Force upload even if archive unchanged
   -v         Verbose / DEBUG output
   -h         Show help

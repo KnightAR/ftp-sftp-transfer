@@ -31,6 +31,7 @@
 #   -p PASS    FTP/SFTP password override
 #   -t DIR     Staging temp directory                (default: auto mktemp)
 #   -j N       Parallel download workers             (default: 4)
+#   -T N       zpaqfranz thread count                (default: 25% of nproc, max 8)
 #   -v         Verbose / DEBUG output to stdout
 #   -h         Show this help message
 #
@@ -79,6 +80,7 @@ CLI_USER=""
 CLI_PASS=""
 CLI_TEMP_DIR=""
 CLI_WORKERS=4
+CLI_THREADS=0        # 0 = auto (25% of nproc, max 8)
 CLI_VERBOSE=false
 
 # Runtime state
@@ -118,6 +120,7 @@ Options:
   -p PASS    Password for FTP/SFTP sources
   -t DIR     Staging temp directory       (default: auto mktemp)
   -j N       Parallel download workers   (default: 4)
+  -T N       zpaqfranz thread count      (default: 25% of nproc, max 8)
   -v         Verbose / DEBUG output
   -h         Show this help
 
@@ -130,13 +133,14 @@ EOF
 # ============================================================
 parse_args() {
     local opt
-    while getopts ":c:u:p:t:j:vh" opt; do
+    while getopts ":c:u:p:t:j:T:vh" opt; do
         case "${opt}" in
             c) CLI_CONFIG="${OPTARG}"   ;;
             u) CLI_USER="${OPTARG}"     ;;
             p) CLI_PASS="${OPTARG}"     ;;
             t) CLI_TEMP_DIR="${OPTARG}" ;;
             j) CLI_WORKERS="${OPTARG}"  ;;
+            T) CLI_THREADS="${OPTARG}"  ;;
             v) CLI_VERBOSE=true         ;;
             h) usage; exit 0            ;;
             :) echo "ERROR: Option -${OPTARG} requires an argument." >&2; usage; exit 1 ;;
@@ -164,6 +168,16 @@ parse_args() {
     # Validate -j is numeric
     if ! [[ "${CLI_WORKERS}" =~ ^[0-9]+$ ]] || (( CLI_WORKERS < 1 )); then
         echo "ERROR: -j must be a positive integer (got: ${CLI_WORKERS})" >&2
+        exit 1
+    fi
+
+    # Validate -T is numeric (0 = auto is not a valid CLI value; must be >= 1)
+    if ! [[ "${CLI_THREADS}" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: -T must be a non-negative integer (got: ${CLI_THREADS})" >&2
+        exit 1
+    fi
+    if (( CLI_THREADS < 0 )); then
+        echo "ERROR: -T must be >= 1 (got: ${CLI_THREADS})" >&2
         exit 1
     fi
 }
@@ -509,6 +523,10 @@ main() {
 
     # Detect zpaqfranz
     detect_zpaqfranz
+
+    # Calculate and set zpaqfranz thread count
+    zpaq_calc_threads "${CLI_THREADS}"
+    log "INFO" "zpaqfranz threads: ${ZPAQFRANZ_THREADS}"
 
     # Load config for credential fallbacks
     load_credentials_from_config

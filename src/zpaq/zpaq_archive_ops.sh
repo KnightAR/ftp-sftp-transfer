@@ -41,7 +41,10 @@
 #       Returns 0 on success (including already-exists skip), 1 on error.
 #
 # zpaqfranz add invocation used throughout:
-#   zpaqfranz a <archive> <internal_name> -stdin -m5 -ssd
+#   zpaqfranz a <archive> <internal_name> -stdin -m5 -ssd -threads N
+#
+# Thread count N is read from ZPAQFRANZ_THREADS (set by zpaq_calc_threads()
+# in zpaq_utils.sh). Default: 25% of nproc, minimum 1, maximum 8.
 #
 # Dependency order:
 #   Must be sourced after:
@@ -170,10 +173,11 @@ decompress_to_stdout() {
 # zpaq_add_stdin ARCHIVE INTERNAL_NAME
 #
 # Reads from stdin and adds it to ARCHIVE as INTERNAL_NAME.
-# Uses: zpaqfranz a <archive> <internal_name> -stdin -m5 -ssd
+# Uses: zpaqfranz a <archive> <internal_name> -stdin -m5 -ssd -threads N
 #
-# -m5   compression level 5 (balanced)
-# -ssd  SSD-optimised I/O scheduler
+# -m5         compression level 5 (balanced)
+# -ssd        SSD-optimised I/O scheduler
+# -threads N  thread count from ZPAQFRANZ_THREADS (set by zpaq_calc_threads())
 #
 # Returns 0 on success, 1 on error.
 # MUST NOT be called from inside $(...) — uses log().
@@ -182,14 +186,17 @@ zpaq_add_stdin() {
     local archive="$1"
     local internal_name="$2"
 
-    log "INFO" "zpaq_add_stdin: adding '${internal_name}' → ${archive}"
+    # Use ZPAQFRANZ_THREADS if set; fall back to 1 if not yet initialised
+    local threads="${ZPAQFRANZ_THREADS:-1}"
+
+    log "INFO" "zpaq_add_stdin: adding '${internal_name}' → ${archive} (threads=${threads})"
 
     local rc=0
     local line
     while IFS= read -r line; do
         log "DEBUG" "zpaqfranz a: ${line}"
     done < <("${ZPAQFRANZ_BIN}" a "${archive}" "${internal_name}" \
-                -stdin -m5 -ssd 2>&1 >&3) 3>&1 || rc=$?
+                -stdin -m5 -ssd -threads "${threads}" 2>&1 >&3) 3>&1 || rc=$?
 
     if (( rc != 0 )); then
         log "ERROR" "zpaq_add_stdin: zpaqfranz a failed (rc=${rc}) for '${internal_name}'"

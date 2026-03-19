@@ -33,6 +33,7 @@
 #   -c FILE    Config file (SFTP credentials)     (default: ./transfer.conf)
 #   -k N       Number of timestamped backups to keep (default: 7)
 #   -t DIR     Temp directory for verification    (default: auto mktemp)
+#   -T N       zpaqfranz thread count             (default: 25% of nproc, max 8)
 #   -f         Force upload even if manifest shows no change
 #   -v         Verbose / DEBUG output to stdout
 #   -h         Show this help message
@@ -84,6 +85,7 @@ readonly SCRIPT_NAME
 CLI_CONFIG="${SCRIPT_DIR}/transfer.conf"
 CLI_KEEP=7
 CLI_TEMP_DIR=""
+CLI_THREADS=0        # 0 = auto (25% of nproc, max 8)
 CLI_FORCE=false
 CLI_VERBOSE=false
 
@@ -134,6 +136,7 @@ Options:
   -c FILE    Config file (SFTP credentials)       (default: ./transfer.conf)
   -k N       Timestamped backups to keep          (default: 7)
   -t DIR     Temp dir for verification downloads  (default: auto mktemp)
+  -T N       zpaqfranz thread count               (default: 25% of nproc, max 8)
   -f         Force upload even if archive unchanged
   -v         Verbose / DEBUG output
   -h         Show this help
@@ -149,14 +152,15 @@ EOF
 # ============================================================
 parse_args() {
     local opt
-    while getopts ":c:k:t:fvh" opt; do
+    while getopts ":c:k:t:T:fvh" opt; do
         case "${opt}" in
-            c) CLI_CONFIG="${OPTARG}"  ;;
-            k) CLI_KEEP="${OPTARG}"    ;;
-            t) CLI_TEMP_DIR="${OPTARG}";;
-            f) CLI_FORCE=true          ;;
-            v) CLI_VERBOSE=true        ;;
-            h) usage; exit 0           ;;
+            c) CLI_CONFIG="${OPTARG}"   ;;
+            k) CLI_KEEP="${OPTARG}"     ;;
+            t) CLI_TEMP_DIR="${OPTARG}" ;;
+            T) CLI_THREADS="${OPTARG}"  ;;
+            f) CLI_FORCE=true           ;;
+            v) CLI_VERBOSE=true         ;;
+            h) usage; exit 0            ;;
             :) echo "ERROR: Option -${OPTARG} requires an argument." >&2; usage; exit 1 ;;
             ?) echo "ERROR: Unknown option: -${OPTARG}" >&2; usage; exit 1 ;;
         esac
@@ -184,6 +188,12 @@ parse_args() {
     # Validate -k is a positive integer
     if ! [[ "${CLI_KEEP}" =~ ^[0-9]+$ ]] || (( CLI_KEEP < 1 )); then
         echo "ERROR: -k must be a positive integer (got: ${CLI_KEEP})" >&2
+        exit 1
+    fi
+
+    # Validate -T is a non-negative integer (0 = auto)
+    if ! [[ "${CLI_THREADS}" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: -T must be a non-negative integer (got: ${CLI_THREADS})" >&2
         exit 1
     fi
 }
@@ -383,6 +393,10 @@ main() {
 
     # Detect zpaqfranz
     detect_zpaqfranz
+
+    # Calculate and set zpaqfranz thread count
+    zpaq_calc_threads "${CLI_THREADS}"
+    log "INFO" "zpaqfranz threads: ${ZPAQFRANZ_THREADS}"
 
     # Setup temp dir for verification downloads
     setup_staging

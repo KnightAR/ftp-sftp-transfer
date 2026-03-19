@@ -27,6 +27,11 @@
 # Resolved path to zpaqfranz binary — set by detect_zpaqfranz().
 ZPAQFRANZ_BIN=""
 
+# Thread count used by zpaqfranz — set by zpaq_calc_threads().
+# Callers (zpaq_archive_ops.sh, zpaq_archive.sh) may override this after
+# calling zpaq_calc_threads() by assigning ZPAQFRANZ_THREADS directly.
+ZPAQFRANZ_THREADS=1
+
 # detect_zpaqfranz
 #
 # Locates the zpaqfranz binary and sets ZPAQFRANZ_BIN.
@@ -101,11 +106,13 @@ zpaq_test_archive() {
 
     log "INFO" "Testing archive integrity: ${archive}"
 
+    local threads="${ZPAQFRANZ_THREADS:-1}"
+
     local rc=0
     local line
     while IFS= read -r line; do
         log "DEBUG" "zpaqfranz t: ${line}"
-    done < <("${ZPAQFRANZ_BIN}" t "${archive}" 2>&1) || rc=$?
+    done < <("${ZPAQFRANZ_BIN}" t "${archive}" -threads "${threads}" 2>&1) || rc=$?
 
     # zpaqfranz t exits 0 on success, non-zero on any error
     if (( rc != 0 )); then
@@ -115,4 +122,49 @@ zpaq_test_archive() {
 
     log "INFO" "Archive integrity OK: ${archive}"
     return 0
+}
+
+# zpaq_calc_threads [REQUESTED]
+#
+# Calculates the number of threads to pass to zpaqfranz -threads and sets
+# ZPAQFRANZ_THREADS.
+#
+# Rules:
+#   - If REQUESTED is given and > 0, use it directly (CLI override).
+#   - Otherwise, default to 25% of available nproc, minimum 1, maximum 8.
+#
+# The 25%/max-8 default is intentional: zpaqfranz compression is CPU-heavy;
+# leaving headroom avoids starving other processes on shared servers.
+#
+# After calling this function, ZPAQFRANZ_THREADS is available globally.
+# zpaq_add_stdin() reads ZPAQFRANZ_THREADS automatically — callers do not
+# need to pass it explicitly.
+#
+# Usage:
+#   zpaq_calc_threads          # auto: 25% of nproc, max 8
+#   zpaq_calc_threads 4        # explicit: 4 threads
+zpaq_calc_threads() {
+    local requested="${1:-0}"
+
+    if (( requested > 0 )); then
+        ZPAQFRANZ_THREADS="${requested}"
+        log "DEBUG" "zpaq_calc_threads: using requested thread count: ${ZPAQFRANZ_THREADS}"
+        return 0
+    fi
+
+    # Detect available logical CPUs
+    local total_cpus=1
+    if command -v nproc &>/dev/null; then
+        total_cpus=$(nproc 2>/dev/null || echo 1)
+    elif [[ -r /proc/cpuinfo ]]; then
+        total_cpus=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
+    fi
+
+    # 25% of total, rounded down, minimum 1, maximum 8
+    local calculated=$(( total_cpus / 4 ))
+    (( calculated < 1 )) && calculated=1
+    (( calculated > 8 )) && calculated=8
+
+    ZPAQFRANZ_THREADS="${calculated}"
+    log "DEBUG" "zpaq_calc_threads: total_cpus=${total_cpus} -> threads=${ZPAQFRANZ_THREADS} (25% capped at 8)"
 }

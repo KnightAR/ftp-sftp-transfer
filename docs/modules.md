@@ -144,8 +144,9 @@ zpaqfranz utilities. Depends on core only (plus SFTP credentials for `zpaq_sftp_
 
 ### zpaq_utils.sh
 - `detect_zpaqfranz()` — locates `zpaqfranz` on PATH, sets `ZPAQFRANZ_BIN`. Exits with install hint if not found.
+- `zpaq_calc_threads [N]` — calculates the thread count for zpaqfranz and sets `ZPAQFRANZ_THREADS`. With no argument: 25% of `nproc`, minimum 1, maximum 8. With an explicit N > 0: uses N directly. All zpaqfranz invocations read `ZPAQFRANZ_THREADS` automatically.
 - `zpaq_file_exists ARCHIVE INTERNAL_NAME` — returns 0 if the internal name is already in the archive (uses `zpaqfranz l | grep -F "+ NAME"`).
-- `zpaq_test_archive ARCHIVE` — runs `zpaqfranz t`, streams output to log at DEBUG level. Returns 0 on success.
+- `zpaq_test_archive ARCHIVE` — runs `zpaqfranz t -threads N`, streams output to log at DEBUG level. Returns 0 on success.
 
 ### zpaq_manifest.sh
 Manages `.manifest` files co-located with `.zpaq` archives:
