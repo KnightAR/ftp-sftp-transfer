@@ -181,6 +181,10 @@ zpaq_multipart_add() {
     # when -v is active.  PIPESTATUS[0] captures zpaqfranz's exit code
     # (not the while-loop's), which || rc=$? on a process substitution
     # would get wrong.
+    # -v is passed to zpaqfranz itself when CLI_VERBOSE=true.
+    local verbose_flag=""
+    [[ "${CLI_VERBOSE:-false}" == true ]] && verbose_flag="-v"
+
     local line
     if (( use_dot_sweep == 0 )); then
         # Explicit file list
@@ -190,6 +194,7 @@ zpaq_multipart_add() {
                     -fragment "${fragment}" \
                     ${extra_flags} \
                     -threads "${threads}" \
+                    ${verbose_flag} \
                     2>&1 \
             | while IFS= read -r line; do
                 log "DEBUG" "zpaqfranz: ${line}"
@@ -203,6 +208,7 @@ zpaq_multipart_add() {
                     -fragment "${fragment}" \
                     ${extra_flags} \
                     -threads "${threads}" \
+                    ${verbose_flag} \
                     2>&1 \
             | while IFS= read -r line; do
                 log "DEBUG" "zpaqfranz: ${line}"

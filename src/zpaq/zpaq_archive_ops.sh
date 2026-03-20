@@ -197,9 +197,13 @@ zpaq_add_stdin() {
     # stdbuf -oL forces line-buffered output from zpaqfranz so each progress
     # line is logged immediately rather than held in the pipe buffer until
     # zpaqfranz exits.  This gives live progress when -v is used.
+    # -v is passed to zpaqfranz itself when CLI_VERBOSE=true.
+    local verbose_flag=""
+    [[ "${CLI_VERBOSE:-false}" == true ]] && verbose_flag="-v"
+
     local line rc
     stdbuf -oL "${ZPAQFRANZ_BIN}" a "${archive}" "${internal_name}" \
-        -stdin -m5 -ssd -threads "${threads}" 2>&1 \
+        -stdin -m5 -ssd -threads "${threads}" ${verbose_flag} 2>&1 \
         | while IFS= read -r line; do
             log "DEBUG" "zpaqfranz a: ${line}"
           done
