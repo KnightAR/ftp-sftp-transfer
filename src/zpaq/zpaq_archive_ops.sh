@@ -191,12 +191,16 @@ zpaq_add_stdin() {
 
     log "INFO" "zpaq_add_stdin: adding '${internal_name}' → ${archive} (threads=${threads})"
 
-    local rc=0
-    local line
-    while IFS= read -r line; do
-        log "DEBUG" "zpaqfranz a: ${line}"
-    done < <("${ZPAQFRANZ_BIN}" a "${archive}" "${internal_name}" \
-                -stdin -m5 -ssd -threads "${threads}" 2>&1 >&3) 3>&1 || rc=$?
+    # zpaqfranz reads the file data from stdin.  We capture its stdout+stderr
+    # for logging by piping through a read loop, then recover the zpaqfranz
+    # exit code from PIPESTATUS (index 0 = zpaqfranz, index 1 = while loop).
+    local line rc
+    "${ZPAQFRANZ_BIN}" a "${archive}" "${internal_name}" \
+        -stdin -m5 -ssd -threads "${threads}" 2>&1 \
+        | while IFS= read -r line; do
+            log "DEBUG" "zpaqfranz a: ${line}"
+          done
+    rc="${PIPESTATUS[0]}"
 
     if (( rc != 0 )); then
         log "ERROR" "zpaq_add_stdin: zpaqfranz a failed (rc=${rc}) for '${internal_name}'"
