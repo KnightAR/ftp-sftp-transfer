@@ -191,15 +191,15 @@ zpaq_add_stdin() {
 
     log "INFO" "zpaq_add_stdin: adding '${internal_name}' → ${archive} (threads=${threads})"
 
-    # zpaqfranz writes its progress to stderr.  We let stderr go directly
-    # to the terminal so the user sees live output when -v is used.
-    # stdout is discarded (zpaqfranz a -stdin writes the archive to the file
-    # path, not stdout; any stdout is incidental progress text).
-    # Exit code is captured directly — no pipe, no PIPESTATUS needed.
+    # zpaqfranz writes progress to stderr (terminal) and may write to stdout.
+    # Stdout is tee'd to LOG_FILE so it appears in the log and on the terminal.
+    # Stderr goes directly to the terminal for live progress display.
+    # PIPESTATUS[0] captures zpaqfranz's exit code across the tee pipe.
     local rc=0
     "${ZPAQFRANZ_BIN}" a "${archive}" "${internal_name}" \
         -stdin -m5 -ssd -threads "${threads}" \
-        > /dev/null || rc=$?
+        | tee -a "${LOG_FILE:-/dev/null}" > /dev/null
+    rc="${PIPESTATUS[0]}"
 
     if (( rc != 0 )); then
         log "ERROR" "zpaq_add_stdin: zpaqfranz a failed (rc=${rc}) for '${internal_name}'"

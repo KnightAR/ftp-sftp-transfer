@@ -108,12 +108,14 @@ zpaq_test_archive() {
 
     local threads="${ZPAQFRANZ_THREADS:-1}"
 
-    # zpaqfranz writes its progress to stderr.  We let stderr go directly
-    # to the terminal so the user sees live output when -v is used.
-    # Exit code is captured directly — no pipe needed.
+    # zpaqfranz writes progress to stderr (terminal) and may write to stdout.
+    # Stdout is tee'd to LOG_FILE so it appears in the log and on the terminal.
+    # Stderr goes directly to the terminal for live progress display.
+    # PIPESTATUS[0] captures zpaqfranz's exit code across the tee pipe.
     local rc=0
     "${ZPAQFRANZ_BIN}" t "${archive}" -threads "${threads}" \
-        > /dev/null || rc=$?
+        | tee -a "${LOG_FILE:-/dev/null}" > /dev/null
+    rc="${PIPESTATUS[0]}"
 
     # zpaqfranz t exits 0 on success, non-zero on any error
     if (( rc != 0 )); then

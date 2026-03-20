@@ -177,9 +177,10 @@ zpaq_multipart_add() {
 
     pushd "${temp_dir}" > /dev/null
 
-    # zpaqfranz writes its progress to stderr.  We let stderr go directly
-    # to the terminal so the user sees live output when -v is used.
-    # Exit code is captured directly — no pipe needed.
+    # zpaqfranz writes progress to stderr (terminal) and may write to stdout.
+    # Stdout is tee'd to LOG_FILE so it appears in the log and on the terminal.
+    # Stderr goes directly to the terminal for live progress display.
+    # PIPESTATUS[0] captures zpaqfranz's exit code across the tee pipe.
     if (( use_dot_sweep == 0 )); then
         # Explicit file list
         "${ZPAQFRANZ_BIN}" a "${archive_pattern}" \
@@ -188,7 +189,8 @@ zpaq_multipart_add() {
                     -fragment "${fragment}" \
                     ${extra_flags} \
                     -threads "${threads}" \
-                    > /dev/null || rc=$?
+                    | tee -a "${LOG_FILE:-/dev/null}" > /dev/null
+        rc="${PIPESTATUS[0]}"
     else
         # Dot sweep fallback
         "${ZPAQFRANZ_BIN}" a "${archive_pattern}" \
@@ -197,7 +199,8 @@ zpaq_multipart_add() {
                     -fragment "${fragment}" \
                     ${extra_flags} \
                     -threads "${threads}" \
-                    > /dev/null || rc=$?
+                    | tee -a "${LOG_FILE:-/dev/null}" > /dev/null
+        rc="${PIPESTATUS[0]}"
     fi
 
     popd > /dev/null
