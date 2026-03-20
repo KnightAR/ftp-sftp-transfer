@@ -194,8 +194,11 @@ zpaq_add_stdin() {
     # zpaqfranz reads the file data from stdin.  We capture its stdout+stderr
     # for logging by piping through a read loop, then recover the zpaqfranz
     # exit code from PIPESTATUS (index 0 = zpaqfranz, index 1 = while loop).
+    # stdbuf -oL forces line-buffered output from zpaqfranz so each progress
+    # line is logged immediately rather than held in the pipe buffer until
+    # zpaqfranz exits.  This gives live progress when -v is used.
     local line rc
-    "${ZPAQFRANZ_BIN}" a "${archive}" "${internal_name}" \
+    stdbuf -oL "${ZPAQFRANZ_BIN}" a "${archive}" "${internal_name}" \
         -stdin -m5 -ssd -threads "${threads}" 2>&1 \
         | while IFS= read -r line; do
             log "DEBUG" "zpaqfranz a: ${line}"

@@ -177,30 +177,37 @@ zpaq_multipart_add() {
 
     pushd "${temp_dir}" > /dev/null
 
+    # stdbuf -oL forces line-buffered output so progress is logged live
+    # when -v is active.  PIPESTATUS[0] captures zpaqfranz's exit code
+    # (not the while-loop's), which || rc=$? on a process substitution
+    # would get wrong.
+    local line
     if (( use_dot_sweep == 0 )); then
         # Explicit file list
-        local line
-        while IFS= read -r line; do
-            log "DEBUG" "zpaqfranz: ${line}"
-        done < <("${ZPAQFRANZ_BIN}" a "${archive_pattern}" \
+        stdbuf -oL "${ZPAQFRANZ_BIN}" a "${archive_pattern}" \
                     "${_file_list_ref[@]}" \
                     "${compression}" \
                     -fragment "${fragment}" \
                     ${extra_flags} \
                     -threads "${threads}" \
-                    2>&1) || rc=$?
+                    2>&1 \
+            | while IFS= read -r line; do
+                log "DEBUG" "zpaqfranz: ${line}"
+              done
+        rc="${PIPESTATUS[0]}"
     else
         # Dot sweep fallback
-        local line
-        while IFS= read -r line; do
-            log "DEBUG" "zpaqfranz: ${line}"
-        done < <("${ZPAQFRANZ_BIN}" a "${archive_pattern}" \
+        stdbuf -oL "${ZPAQFRANZ_BIN}" a "${archive_pattern}" \
                     . \
                     "${compression}" \
                     -fragment "${fragment}" \
                     ${extra_flags} \
                     -threads "${threads}" \
-                    2>&1) || rc=$?
+                    2>&1 \
+            | while IFS= read -r line; do
+                log "DEBUG" "zpaqfranz: ${line}"
+              done
+        rc="${PIPESTATUS[0]}"
     fi
 
     popd > /dev/null

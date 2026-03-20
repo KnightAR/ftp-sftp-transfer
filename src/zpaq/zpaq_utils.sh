@@ -108,11 +108,15 @@ zpaq_test_archive() {
 
     local threads="${ZPAQFRANZ_THREADS:-1}"
 
-    local rc=0
-    local line
-    while IFS= read -r line; do
-        log "DEBUG" "zpaqfranz t: ${line}"
-    done < <("${ZPAQFRANZ_BIN}" t "${archive}" -threads "${threads}" 2>&1) || rc=$?
+    # stdbuf -oL: line-buffered output for live progress under -v.
+    # PIPESTATUS[0]: zpaqfranz exit code (|| rc=$? on process substitution
+    # captures the while-loop's code instead, which is always 0).
+    local rc line
+    stdbuf -oL "${ZPAQFRANZ_BIN}" t "${archive}" -threads "${threads}" 2>&1 \
+        | while IFS= read -r line; do
+            log "DEBUG" "zpaqfranz t: ${line}"
+          done
+    rc="${PIPESTATUS[0]}"
 
     # zpaqfranz t exits 0 on success, non-zero on any error
     if (( rc != 0 )); then
