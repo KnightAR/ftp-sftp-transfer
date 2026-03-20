@@ -114,7 +114,7 @@ zpaq_test_archive() {
     # PIPESTATUS[0] captures zpaqfranz's exit code across the tee pipe.
     local rc=0
     "${ZPAQFRANZ_BIN}" t "${archive}" -threads "${threads}" \
-        | tee -a "${LOG_FILE:-/dev/null}" > /dev/null
+        | tee -a "${LOG_FILE:-/dev/null}"
     rc="${PIPESTATUS[0]}"
 
     # zpaqfranz t exits 0 on success, non-zero on any error

@@ -198,7 +198,7 @@ zpaq_add_stdin() {
     local rc=0
     "${ZPAQFRANZ_BIN}" a "${archive}" "${internal_name}" \
         -stdin -m5 -ssd -threads "${threads}" \
-        | tee -a "${LOG_FILE:-/dev/null}" > /dev/null
+        | tee -a "${LOG_FILE:-/dev/null}"
     rc="${PIPESTATUS[0]}"
 
     if (( rc != 0 )); then

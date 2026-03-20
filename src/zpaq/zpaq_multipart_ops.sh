@@ -189,7 +189,7 @@ zpaq_multipart_add() {
                     -fragment "${fragment}" \
                     ${extra_flags} \
                     -threads "${threads}" \
-                    | tee -a "${LOG_FILE:-/dev/null}" > /dev/null
+                    | tee -a "${LOG_FILE:-/dev/null}"
         rc="${PIPESTATUS[0]}"
     else
         # Dot sweep fallback
@@ -199,7 +199,7 @@ zpaq_multipart_add() {
                     -fragment "${fragment}" \
                     ${extra_flags} \
                     -threads "${threads}" \
-                    | tee -a "${LOG_FILE:-/dev/null}" > /dev/null
+                    | tee -a "${LOG_FILE:-/dev/null}"
         rc="${PIPESTATUS[0]}"
     fi
 
