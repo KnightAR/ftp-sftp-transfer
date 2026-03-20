@@ -177,43 +177,27 @@ zpaq_multipart_add() {
 
     pushd "${temp_dir}" > /dev/null
 
-    # stdbuf -oL forces line-buffered output so progress is logged live
-    # when -v is active.  PIPESTATUS[0] captures zpaqfranz's exit code
-    # (not the while-loop's), which || rc=$? on a process substitution
-    # would get wrong.
-    # -v is passed to zpaqfranz itself when CLI_VERBOSE=true.
-    local verbose_flag=""
-    [[ "${CLI_VERBOSE:-false}" == true ]] && verbose_flag="-v"
-
-    local line
+    # zpaqfranz writes its progress to stderr.  We let stderr go directly
+    # to the terminal so the user sees live output when -v is used.
+    # Exit code is captured directly — no pipe needed.
     if (( use_dot_sweep == 0 )); then
         # Explicit file list
-        stdbuf -oL "${ZPAQFRANZ_BIN}" a "${archive_pattern}" \
+        "${ZPAQFRANZ_BIN}" a "${archive_pattern}" \
                     "${_file_list_ref[@]}" \
                     "${compression}" \
                     -fragment "${fragment}" \
                     ${extra_flags} \
                     -threads "${threads}" \
-                    ${verbose_flag} \
-                    2>&1 \
-            | while IFS= read -r line; do
-                log "DEBUG" "zpaqfranz: ${line}"
-              done
-        rc="${PIPESTATUS[0]}"
+                    > /dev/null || rc=$?
     else
         # Dot sweep fallback
-        stdbuf -oL "${ZPAQFRANZ_BIN}" a "${archive_pattern}" \
+        "${ZPAQFRANZ_BIN}" a "${archive_pattern}" \
                     . \
                     "${compression}" \
                     -fragment "${fragment}" \
                     ${extra_flags} \
                     -threads "${threads}" \
-                    ${verbose_flag} \
-                    2>&1 \
-            | while IFS= read -r line; do
-                log "DEBUG" "zpaqfranz: ${line}"
-              done
-        rc="${PIPESTATUS[0]}"
+                    > /dev/null || rc=$?
     fi
 
     popd > /dev/null

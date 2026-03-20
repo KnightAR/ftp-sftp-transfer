@@ -191,23 +191,15 @@ zpaq_add_stdin() {
 
     log "INFO" "zpaq_add_stdin: adding '${internal_name}' → ${archive} (threads=${threads})"
 
-    # zpaqfranz reads the file data from stdin.  We capture its stdout+stderr
-    # for logging by piping through a read loop, then recover the zpaqfranz
-    # exit code from PIPESTATUS (index 0 = zpaqfranz, index 1 = while loop).
-    # stdbuf -oL forces line-buffered output from zpaqfranz so each progress
-    # line is logged immediately rather than held in the pipe buffer until
-    # zpaqfranz exits.  This gives live progress when -v is used.
-    # -v is passed to zpaqfranz itself when CLI_VERBOSE=true.
-    local verbose_flag=""
-    [[ "${CLI_VERBOSE:-false}" == true ]] && verbose_flag="-v"
-
-    local line rc
-    stdbuf -oL "${ZPAQFRANZ_BIN}" a "${archive}" "${internal_name}" \
-        -stdin -m5 -ssd -threads "${threads}" ${verbose_flag} 2>&1 \
-        | while IFS= read -r line; do
-            log "DEBUG" "zpaqfranz a: ${line}"
-          done
-    rc="${PIPESTATUS[0]}"
+    # zpaqfranz writes its progress to stderr.  We let stderr go directly
+    # to the terminal so the user sees live output when -v is used.
+    # stdout is discarded (zpaqfranz a -stdin writes the archive to the file
+    # path, not stdout; any stdout is incidental progress text).
+    # Exit code is captured directly — no pipe, no PIPESTATUS needed.
+    local rc=0
+    "${ZPAQFRANZ_BIN}" a "${archive}" "${internal_name}" \
+        -stdin -m5 -ssd -threads "${threads}" \
+        > /dev/null || rc=$?
 
     if (( rc != 0 )); then
         log "ERROR" "zpaq_add_stdin: zpaqfranz a failed (rc=${rc}) for '${internal_name}'"

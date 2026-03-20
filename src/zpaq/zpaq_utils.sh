@@ -108,19 +108,12 @@ zpaq_test_archive() {
 
     local threads="${ZPAQFRANZ_THREADS:-1}"
 
-    # stdbuf -oL: line-buffered output for live progress under -v.
-    # PIPESTATUS[0]: zpaqfranz exit code (|| rc=$? on process substitution
-    # captures the while-loop's code instead, which is always 0).
-    # -v is passed to zpaqfranz itself when CLI_VERBOSE=true.
-    local verbose_flag=""
-    [[ "${CLI_VERBOSE:-false}" == true ]] && verbose_flag="-v"
-
-    local rc line
-    stdbuf -oL "${ZPAQFRANZ_BIN}" t "${archive}" -threads "${threads}" ${verbose_flag} 2>&1 \
-        | while IFS= read -r line; do
-            log "DEBUG" "zpaqfranz t: ${line}"
-          done
-    rc="${PIPESTATUS[0]}"
+    # zpaqfranz writes its progress to stderr.  We let stderr go directly
+    # to the terminal so the user sees live output when -v is used.
+    # Exit code is captured directly — no pipe needed.
+    local rc=0
+    "${ZPAQFRANZ_BIN}" t "${archive}" -threads "${threads}" \
+        > /dev/null || rc=$?
 
     # zpaqfranz t exits 0 on success, non-zero on any error
     if (( rc != 0 )); then
