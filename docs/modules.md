@@ -140,7 +140,7 @@ Provides `restore_commit_thread()` — runs as a background process alongside do
 
 ## src/zpaq/
 
-zpaqfranz utilities. Depends on core only (plus SFTP credentials for `zpaq_sftp_ops.sh`). Designed as a clean reusable library — any future script can source individual modules independently.
+zpaqfranz utilities. Depends on core only (plus SFTP credentials for `zpaq_sftp_ops.sh` and `zpaq_multipart_ops.sh`). Designed as a clean reusable library — any future script can source individual modules independently.
 
 ### zpaq_utils.sh
 - `detect_zpaqfranz()` — locates `zpaqfranz` on PATH, sets `ZPAQFRANZ_BIN`. Exits with install hint if not found.
@@ -172,6 +172,45 @@ Full SFTP upload workflow for `storezpaq.sh`:
 - `zpaq_sftp_download_manifest REMOTE_DIR ZPAQ_FILE LOCAL_DEST` — downloads remote `.manifest`
 - `zpaq_sftp_upload_manifest ZPAQ_FILE REMOTE_DIR` — uploads local `.manifest` to SFTP
 - `zpaq_sftp_prune_backups REMOTE_DIR BASE KEEP` — lists and removes oldest timestamped backups beyond the keep limit
+
+### zpaq_multipart_manifest.sh
+Manages the multipart manifest file (`<basename>.zpaq.manifest`) for `storezpaq_multi.sh`. Holds all manifest state in the `MP_MANIFEST_*` global variables and associative arrays (`MP_MANIFEST_PART_SHA256[]`, `MP_MANIFEST_PART_SIZE[]`, `MP_MANIFEST_PART_ADDED[]`); callers read and write those globals via the functions below rather than touching the file directly.
+- `multipart_manifest_path BASENAME LOCAL_DIR` — echoes the canonical manifest path: `<LOCAL_DIR>/<basename>.zpaq.manifest`
+- `multipart_manifest_read MANIFEST_PATH` — parses the manifest into `MP_MANIFEST_*` globals; returns 1 if the file is absent or malformed
+- `multipart_manifest_write MANIFEST_PATH` — writes current in-memory state to the manifest file; parts are emitted in sorted order
+- `multipart_manifest_add_part PART_FILENAME SIZE SHA256` — adds a new part to the in-memory state (increments `total_parts` and `total_size`); call `multipart_manifest_write` to persist
+- `multipart_manifest_part_known PART_FILENAME` — returns 0 if the part is already recorded in the manifest, 1 if not
+- `multipart_manifest_get_fragment MANIFEST_PATH` — echoes the `fragment=` value from a manifest file without loading all state
+- `multipart_manifest_check_fragment MANIFEST_PATH CONFIG_FRAGMENT` — validates that the config fragment matches the locked manifest value; returns 1 (and logs an error) on mismatch; returns 0 on match or when no manifest exists yet (first add)
+- `multipart_manifest_remote_diverged LOCAL_PATH REMOTE_PATH` — compares local and remote manifests by `total_parts`; returns 0 if remote has more parts (download gap), 1 if equal/in-sync, 2 if local has more parts (upload gap)
+
+### zpaq_multipart_ops.sh
+Multipart-specific zpaqfranz operations for `storezpaq_multi.sh`. Maintains a global `ZPAQ_ARCHIVE_CONTENTS[]` associative array as an in-memory content cache, populated once at startup by a single `zpaqfranz l` invocation. All subsequent already-archived checks are O(1) hash lookups against this cache.
+- `zpaq_multipart_build_cache ARCHIVE_PATTERN` — runs `zpaqfranz l <pattern>` once, parses `+ <name>` lines via awk, and populates `ZPAQ_ARCHIVE_CONTENTS[]`
+- `zpaq_multipart_file_known INTERNAL_NAME` — returns 0 if the internal name is in the cache, 1 if not; never invokes zpaqfranz
+- `zpaq_multipart_add ARCHIVE_PATTERN FILE_LIST_ARRAY_NAME TEMP_DIR` — invokes `zpaqfranz a` from inside `TEMP_DIR` (`pushd`/`popd`) with the configured `-fragment`, `-threads`, compression, and extra flags; uses an explicit file list or falls back to a `.` sweep when `total_arg_bytes > ARGMAX_SAFE_THRESHOLD`
+- `zpaq_multipart_upload_part PART_FILE REMOTE_DIR TEMP_DIR` — atomic upload pipeline: copy to `.tmp_upload/<partname>` on SFTP → download back → sha256 verify → rename to live name; retries up to `UPLOAD_RETRY_COUNT` times
+- `zpaq_multipart_upload_manifest MANIFEST_PATH REMOTE_DIR` — uploads the local manifest file directly to SFTP (overwrites in place)
+- `zpaq_multipart_download_manifest REMOTE_DIR BASENAME LOCAL_DEST` — downloads the remote manifest to `LOCAL_DEST`; returns 1 if not present on SFTP
+- `zpaq_multipart_remote_sync BASENAME LOCAL_DIR REMOTE_DIR MANIFEST_PATH TEMP_DIR` — reads remote manifest, computes divergence via `multipart_manifest_remote_diverged`, and either downloads+verifies missing parts (download gap) or re-uploads locally-present parts (upload gap)
+- `check_archive_format_conflict BASENAME LOCAL_DIR REMOTE_DIR TEMP_DIR` — detects a conflict between a legacy single-file `.zpaq` and the new multipart series; aborts with a clear error if both exist
+
+### zpaq_grouping.sh
+Date-based grouping, wildcard expansion, disk-space estimation, and multi-format decompression for `storezpaq_multi.sh`.
+- `detect_decompressor` — probes for available decompressor binaries and sets `BZ2_DECOMPRESS_BIN` (`lbzip2` → `pbzip2` → `bzip2`) and `GZ_DECOMPRESS_BIN` (`pigz` → `gzip`)
+- `extract_date_from_filename FILE` — echoes the `YYYYMMDD` string embedded in `*_YYYYMMDD.*` filenames, or `undated` if no date pattern is found
+- `group_files_by_date FILE_LIST ASSOC_ARRAY_NAME` — populates a caller-supplied associative array mapping date strings to space-separated file lists; undated files go to the `undated` key
+- `expand_sftp_wildcard SFTP_URL RESULT_VAR` — lists an SFTP directory and filters the results against the wildcard pattern in the URL; stores matching full SFTP URLs in `RESULT_VAR`
+- `expand_local_wildcard PATTERN RESULT_VAR` — expands a local shell glob pattern and stores matching paths in `RESULT_VAR`
+- `xz_list_uncompressed_size FILE...` — returns exact uncompressed bytes via `xz --list --robot`; handles multiple files
+- `gz_list_uncompressed_size FILE` — returns uncompressed bytes from the gzip header; returns 1 if the header value indicates >4 GB wraparound (caller should fall back to history)
+- `zip_list_uncompressed_size FILE` — returns exact uncompressed bytes via `unzip -l`
+- `bz2_estimate_uncompressed_size FILE HISTORY_FILE` — estimates uncompressed size by averaging the last `SIZE_HISTORY_SAMPLES` compressed/uncompressed ratios from `HISTORY_FILE` and applying `SIZE_ESTIMATE_SAFETY_FACTOR`; uses `BZ2_DEFAULT_RATIO` when no history exists
+- `estimate_group_uncompressed_size FILE_LIST HISTORY_FILE` — dispatches to the appropriate size function for each file in the list and returns the total estimated bytes
+- `update_size_history COMPRESSED_FILE UNCOMPRESSED_BYTES HISTORY_FILE` — appends a `compressed_bytes  uncompressed_bytes  date  pattern` record to the history file; called after each successful decompression
+- `check_space NEEDED_BYTES AVAILABLE_BYTES HEADROOM_RATIO` — returns 0 if `AVAILABLE × (1 − HEADROOM_RATIO) ≥ NEEDED`, 1 otherwise; logs the computed values
+- `check_filename_collision DEST_PATH` — returns 0 if `DEST_PATH` does not already exist; logs an error and returns 1 if it does
+- `decompress_file COMPRESSED_FILE DEST_DIR SOURCE_BASE_DIR HISTORY_FILE` — copies the compressed file to `DEST_DIR` preserving any subdirectory relative to `SOURCE_BASE_DIR`, decompresses in-place (no `-k`), deletes the compressed copy, and calls `update_size_history`
 
 ---
 

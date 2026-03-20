@@ -14,8 +14,9 @@ A collection of Bash scripts for transferring, archiving, splitting, and recompr
 | `split_restore.sh` | Download parts from SFTP and stream-reassemble into the original file with sha256 verification | [docs/split.md](docs/split.md) |
 | `recompress.sh` | Recompress `.bz2`, `.gz`, `.zip`, `.7z` archives to `.xz` format | [docs/compress.md](docs/compress.md) |
 | `strip_archive.sh` | Remove directories from a compressed tar archive | [docs/compress.md](docs/compress.md) |
-| `zpaq_archive.sh` | Download files from FTP/SFTP/local sources and add them to a `.zpaq` super-archive | [docs/zpaq.md](docs/zpaq.md) |
-| `storezpaq.sh` | Upload a `.zpaq` archive to SFTP with integrity checking, atomic upload, and timestamped backup rotation | [docs/zpaq.md](docs/zpaq.md) |
+| `zpaq_archive.sh` | Download files from FTP/SFTP/local sources and add them to a single-file `.zpaq` super-archive | [docs/zpaq.md](docs/zpaq.md) |
+| `storezpaq.sh` | Upload a single-file `.zpaq` archive to SFTP with integrity checking, atomic upload, and timestamped backup rotation | [docs/zpaq.md](docs/zpaq.md) |
+| `storezpaq_multi.sh` | Download compressed sources, decompress, group by date, and build a growing **multipart** `.zpaq` archive with atomic per-part upload to SFTP | [docs/zpaq.md](docs/zpaq.md) |
 
 ---
 
@@ -33,6 +34,9 @@ sudo apt-get install -y libarchive-tools xz-utils pbzip2 p7zip-full unzip zstd
 # zpaq scripts
 sudo apt-get install zpaqfranz        # Debian 13+
 # or build from source — see docs/zpaq.md
+
+# storezpaq_multi.sh additional decompressors (optional, for best performance)
+sudo apt-get install -y lbzip2 pigz
 ```
 
 ### 2. Configure
@@ -43,7 +47,7 @@ nano transfer.conf
 chmod 600 transfer.conf
 ```
 
-All scripts read `transfer.conf` from the same directory. See [Configuration](#configuration) below for the full variable reference.
+All scripts read `transfer.conf` (or `storezpaq.conf` for `storezpaq_multi.sh`) from the same directory. See [Configuration](#configuration) below for the full variable reference.
 
 ### 3. Run
 
@@ -54,18 +58,26 @@ All scripts read `transfer.conf` from the same directory. See [Configuration](#c
 # Split and upload a large local file
 ./split_upload.sh /data/bigfile.sql.bz2
 
-# Build a zpaq super-archive from multiple sources
+# Build a single-file zpaq super-archive from multiple sources
 ./zpaq_archive.sh backup.zpaq ftp://host/db/ sftp://host2/exports/
 
-# Upload the zpaq archive to SFTP
+# Upload the single-file zpaq archive to SFTP
 ./storezpaq.sh backup.zpaq
+
+# Build a growing multipart zpaq archive from dated compressed sources
+./storezpaq_multi.sh myarchive sftp://host/backups/'*.sql.xz'
+
+# Backfill all unarchived history in one pass
+./storezpaq_multi.sh -backfill myarchive sftp://host/backups/'*.sql.xz'
 ```
 
 ---
 
 ## Configuration
 
-All scripts share `transfer.conf`. Copy `transfer.example.conf` as a starting point.
+### transfer.conf — Shared by all scripts except storezpaq_multi.sh
+
+Copy `transfer.example.conf` as a starting point.
 
 > **Security:** Always `chmod 600 transfer.conf` after editing — it contains credentials. Scripts warn on startup if permissions are too open.
 
@@ -110,6 +122,54 @@ VERIFY_CHECKSUM="true"
 VERIFY_MODE="false"
 REUPLOAD_LOG="./reupload.log"
 VERIFY_ARCHIVE_INTEGRITY=true
+```
+
+### storezpaq.conf — storezpaq_multi.sh
+
+`storezpaq_multi.sh` reads `storezpaq.conf` (in the same directory as the script) rather than `transfer.conf`. The config file is **optional** — all keys have built-in defaults and can be overridden at the command line. Only the five required variables must be set (via config or CLI flags).
+
+```bash
+# === Required ===
+SFTP_HOST="sftp.example.com"
+SFTP_PORT="22"                   # default: 22
+SFTP_USER="sftp_user"
+SFTP_PASS="sftp_password"
+SFTP_REMOTE_DIR="/ihub-db-backups"
+ZPAQ_LOCAL_DIR="/data/zpaq"      # Local directory where all .zpaq parts are stored
+
+# === zpaqfranz compression ===
+ZPAQ_COMPRESSION="-m5"           # default: -m5
+ZPAQ_EXTRA_FLAGS="-ssd"          # default: -ssd
+ZPAQ_FRAGMENT=3                  # CDC fragment size exponent (default: 3 = avg 8 KB)
+                                 # Locked per archive on first add — cannot change later
+ZPAQ_THREADS=""                  # default: 25% of nproc, max 8
+
+# === Multipart naming ===
+ZPAQ_MULTIPART_QUESTION_MARKS=7  # Number of ? in archive pattern (default: 7)
+                                 # basename??????? → basename0000001.zpaq, etc.
+
+# === Decompression ===
+XZ_DECOMPRESS_THREADS=4          # Threads for xz -d (default: 4)
+
+# === Space management ===
+ZPAQ_HEADROOM_RATIO=0.30         # Extra headroom fraction on top of estimated size (default: 0.30)
+BACKFILL_MIN_FREE_GB=100         # Minimum free disk floor for backfill mode (default: 100)
+SIZE_HISTORY_SAMPLES=5           # Number of recent .bz2 decompressions to average (default: 5)
+SIZE_ESTIMATE_SAFETY_FACTOR=1.20 # Safety multiplier applied to bz2 estimates (default: 1.20)
+BZ2_DEFAULT_RATIO=3.5            # Fallback bz2 expansion ratio when no history exists (default: 3.5)
+
+# === ARG_MAX protection ===
+ARGMAX_SAFE_THRESHOLD=131072     # Max bytes in zpaqfranz file list before falling back to . (default: 131072)
+
+# === Upload ===
+UPLOAD_RETRY_COUNT=3             # Per-part upload retry attempts (default: 3)
+
+# === Monitoring ===
+ZPAQ_LOCAL_SIZE_WARN_GB=500      # Warn when local archive set exceeds this size (default: 500)
+
+# === Logging ===
+LOG_DIR=""                       # default: ZPAQ_LOCAL_DIR/logs
+LOG_RETENTION_DAYS=30            # default: 30
 ```
 
 ---
@@ -185,7 +245,7 @@ Requires `bsdtar`: `sudo apt-get install libarchive-tools`
 
 ---
 
-### zpaq_archive.sh — Build a zpaq Super-Archive
+### zpaq_archive.sh — Build a Single-File zpaq Super-Archive
 
 Downloads files from one or more `ftp://`, `sftp://`, or local sources and appends them to a single `.zpaq` archive using `zpaqfranz`. Already-archived files are skipped (idempotent). Downloads run in parallel; `zpaqfranz` add calls are serialised. Subpaths are preserved relative to each source root.
 
@@ -199,7 +259,7 @@ Downloads files from one or more `ftp://`, `sftp://`, or local sources and appen
 
 ---
 
-### storezpaq.sh — Upload zpaq Archive to SFTP
+### storezpaq.sh — Upload Single-File zpaq Archive to SFTP
 
 Uploads a `.zpaq` archive to SFTP with a 5-step safety workflow:
 
@@ -209,13 +269,49 @@ Uploads a `.zpaq` archive to SFTP with a 5-step safety workflow:
 4. **Atomic upload** — upload to `.tmp_upload`, re-download + sha256 verify, rename with timestamped backup of prior version
 5. **Manifest upload** — track state for future no-op detection
 
-The remote path mirrors the local archive path relative to `SFTP_REMOTE_DIR`:
-
 ```bash
 ./storezpaq.sh backup.zpaq                     # → SFTP_REMOTE_DIR/backup.zpaq
 ./storezpaq.sh zpaq/daily/backup.zpaq          # → SFTP_REMOTE_DIR/zpaq/daily/backup.zpaq
 ./storezpaq.sh -k 14 zpaq/daily/backup.zpaq    # Keep 14 timestamped backups
 ./storezpaq.sh -f backup.zpaq                  # Force upload even if unchanged
+```
+
+→ [Full documentation](docs/zpaq.md)
+
+---
+
+### storezpaq_multi.sh — Multipart zpaq Archive from Compressed Sources
+
+Downloads compressed source files (`.xz`, `.bz2`, `.gz`, `.zip`, `.sql`) from SFTP, FTP, or local paths, decompresses them into a flat staging area, groups them by date extracted from filenames (`*_YYYYMMDD.*`), and appends each group to a growing multipart `.zpaq` archive using `zpaqfranz`. Each part is atomically uploaded and sha256-verified before the next group is processed.
+
+Key features:
+
+- **Multipart naming** — `basename???????` pattern produces `basename0000001.zpaq`, `basename0000002.zpaq`, etc. All parts are retained locally (required for zpaqfranz cross-part deduplication)
+- **Fragment lock-in** — `ZPAQ_FRAGMENT` (default 3) is written to the manifest on first add and validated on every subsequent run; mismatches abort immediately
+- **Single content cache** — one `zpaqfranz l` at startup builds an in-memory lookup; no per-file archive scans
+- **Pre-add remote sync** — downloads any parts present on SFTP but missing locally before adding new content
+- **Per-part atomic upload** — upload to `.tmp_upload` → download-back sha256 verify → rename live → update manifest
+- **Backfill mode** (`-backfill`) — combines all unarchived date groups into a single `zpaqfranz add` for maximum cross-file deduplication
+- **bz2 size estimation** — uses a per-basename history file of actual compressed/uncompressed ratios (last 5 samples × 1.20 safety factor) since bzip2 has no uncompressed-size metadata
+- **ARG_MAX protection** — passes an explicit file list to zpaqfranz; falls back to a `.` sweep when the total argument bytes exceed `ARGMAX_SAFE_THRESHOLD` (128 KB)
+
+```bash
+# Normal mode — one zpaq add per date group
+./storezpaq_multi.sh myarchive sftp://host/backups/'*.sql.xz'
+
+# Backfill all unarchived history
+./storezpaq_multi.sh -backfill myarchive sftp://host/backups/'*.sql.xz'
+
+# Limit backfill to the 30 most recent unarchived days
+./storezpaq_multi.sh -backfill -backfill-days 30 myarchive sftp://host/backups/'*.sql.xz'
+
+# Dry run — show what would be done without making changes
+./storezpaq_multi.sh -dry-run myarchive sftp://host/backups/'*.sql.xz'
+
+# Multiple sources with explicit credentials
+./storezpaq_multi.sh -u admin -p secret myarchive \
+    sftp://host/slim/'*.sql.bz2' \
+    sftp://host/vxtl/'*.sql.xz'
 ```
 
 → [Full documentation](docs/zpaq.md)
@@ -232,10 +328,12 @@ ftp-sftp-transfer/
 ├── split_restore.sh        SFTP parts → reassemble
 ├── recompress.sh           Recompress archives to XZ
 ├── strip_archive.sh        Strip directories from tar archives
-├── zpaq_archive.sh         Build / update a .zpaq super-archive
-├── storezpaq.sh            Upload .zpaq to SFTP with safety workflow
+├── zpaq_archive.sh         Build / update a single-file .zpaq super-archive
+├── storezpaq.sh            Upload single-file .zpaq to SFTP with safety workflow
+├── storezpaq_multi.sh      Build multipart .zpaq archive from compressed sources
 │
-├── transfer.conf           Credentials and settings (chmod 600)
+├── transfer.conf           Credentials and settings for all scripts except storezpaq_multi.sh
+├── storezpaq.conf          Credentials and settings for storezpaq_multi.sh (optional)
 ├── transfer.example.conf   Example config — copy and edit
 ├── exclude.list            Basename glob patterns to skip in transfer.sh
 │
@@ -249,7 +347,9 @@ ftp-sftp-transfer/
 │   │                         split_config, split_manifest, split_ops,
 │   │                         split_worker, restore_worker, restore_commit
 │   ├── zpaq/               zpaq_utils, zpaq_manifest,
-│   │                         zpaq_archive_ops, zpaq_sftp_ops
+│   │                         zpaq_archive_ops, zpaq_sftp_ops,
+│   │                         zpaq_multipart_manifest, zpaq_multipart_ops,
+│   │                         zpaq_grouping
 │   ├── workers/            counters, disk_guard, download_worker, upload_worker
 │   └── pipeline/           pipeline, deletion_stage, summary, main
 │
@@ -257,7 +357,7 @@ ftp-sftp-transfer/
 │   ├── transfer.md         transfer.sh detailed documentation
 │   ├── split.md            split_transfer / split_upload / split_restore docs
 │   ├── compress.md         recompress / strip_archive docs
-│   ├── zpaq.md             zpaq_archive / storezpaq docs
+│   ├── zpaq.md             zpaq_archive / storezpaq / storezpaq_multi docs
 │   └── modules.md          src/ module reference
 │
 └── logs/                   Run logs (auto-created)
@@ -279,6 +379,7 @@ Every script that reads or writes the same file uses a `flock`-based exclusive l
 | `split_restore.sh` | `/tmp/ftp_sftp_transfer.lock` |
 | `zpaq_archive.sh` | `<archive>.zpaq.lock` |
 | `storezpaq.sh` | `<archive>.zpaq.lock` |
+| `storezpaq_multi.sh` | `<ZPAQ_LOCAL_DIR>/<basename>.zpaq.lock` |
 
 Locks are OS-held via a file descriptor — automatically released if the process dies without calling `release_lock()`. No stale lock files after crashes.
 
@@ -299,10 +400,15 @@ Locks are OS-held via a file descriptor — automatically released if the proces
 # Daily FTP → SFTP mirror at 2:00 AM
 0 2 * * * /opt/ftp-sftp-transfer/transfer.sh >> /opt/ftp-sftp-transfer/logs/cron.log 2>&1
 
-# Daily zpaq archive update + upload at 3:00 AM
+# Daily zpaq archive update + upload at 3:00 AM (single-file workflow)
 0 3 * * * /opt/ftp-sftp-transfer/zpaq_archive.sh zpaq/daily/backup.zpaq ftp://host/db/ && \
           /opt/ftp-sftp-transfer/storezpaq.sh zpaq/daily/backup.zpaq \
           >> /opt/ftp-sftp-transfer/logs/zpaq_cron.log 2>&1
+
+# Daily multipart zpaq archive update at 4:00 AM
+0 4 * * * /opt/ftp-sftp-transfer/storezpaq_multi.sh myarchive \
+          sftp://host/backups/'*.sql.xz' \
+          >> /opt/ftp-sftp-transfer/logs/multi_cron.log 2>&1
 ```
 
 Set `PATH` explicitly in crontab if binaries are not found:
