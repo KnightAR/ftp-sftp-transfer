@@ -326,117 +326,58 @@ resolve_credentials() {
     esac
 }
 
-# ============================================================
-# process_source SOURCE
-#
-# Dispatches a single source argument to the appropriate downloader,
-# then calls zpaq_add_source for each downloaded file.
-# ============================================================
-
 # Background worker PID tracking
 WORKER_PIDS=()
 
-# Staging subdirectory for downloaded files (shared across sources)
+# Staging subdirectory for downloaded files (remote sources only)
 STAGE_DIR=""
-
-process_source() {
-    local source="$1"
-
-    log "INFO" "Processing source: ${source}"
-
-    case "${source}" in
-        ftp://*)
-            resolve_credentials "${source}"
-            if ! ftp_download_url "${source}" \
-                    "${RESOLVED_USER}" "${RESOLVED_PASS}" "${STAGE_DIR}"; then
-                log "ERROR" "FTP download failed for: ${source}"
-                return 1
-            fi
-            local f
-            for f in "${FTP_DOWNLOADED_FILES[@]}"; do
-                # Internal prefix = path relative to STAGE_DIR, dirname only
-                local rel="${f#"${STAGE_DIR}"/}"
-                local prefix
-                prefix=$(dirname "${rel}")
-                [[ "${prefix}" == "." ]] && prefix=""
-                zpaq_add_source "${ZPAQ_FILE}" "${prefix}" "${f}" "${TEMP_DIR}"
-            done
-            ;;
-
-        sftp://*)
-            resolve_credentials "${source}"
-            if ! sftp_download_url "${source}" \
-                    "${RESOLVED_USER}" "${RESOLVED_PASS}" "${STAGE_DIR}"; then
-                log "ERROR" "SFTP download failed for: ${source}"
-                return 1
-            fi
-            local f
-            for f in "${SFTP_DOWNLOADED_FILES[@]}"; do
-                local rel="${f#"${STAGE_DIR}"/}"
-                local prefix
-                prefix=$(dirname "${rel}")
-                [[ "${prefix}" == "." ]] && prefix=""
-                zpaq_add_source "${ZPAQ_FILE}" "${prefix}" "${f}" "${TEMP_DIR}"
-            done
-            ;;
-
-        *)
-            # Local path (absolute or relative)
-            if [[ ! -e "${source}" ]]; then
-                log "ERROR" "Local source not found: ${source}"
-                return 1
-            fi
-
-            if [[ -d "${source}" ]]; then
-                # Directory: find all files and add each
-                local f
-                while IFS= read -r f; do
-                    local rel="${f#"${source}"/}"
-                    local prefix
-                    prefix=$(dirname "${rel}")
-                    [[ "${prefix}" == "." ]] && prefix=""
-                    zpaq_add_source "${ZPAQ_FILE}" "${prefix}" "${f}" "${TEMP_DIR}"
-                done < <(find "${source}" -type f | sort)
-            else
-                # Single local file
-                zpaq_add_source "${ZPAQ_FILE}" "" "${source}" "${TEMP_DIR}"
-            fi
-            ;;
-    esac
-}
 
 # ============================================================
 # run_parallel_downloads
 #
 # Launches up to CLI_WORKERS parallel background processes, each
-# handling one source.  Downloads are parallelised; the zpaq add
-# calls inside zpaq_add_source are serial (zpaqfranz is not
-# re-entrant on the same archive).
+# handling one remote (FTP/SFTP) source.  Local sources are never
+# copied — their files are read in-place during Phase 2.
 #
 # Implementation note: to keep the zpaqfranz add calls serial while
 # downloads are parallel, we split the work into two phases:
-#   Phase 1 — parallel: download each source into its own subdir
-#   Phase 2 — serial: walk staged files and add to zpaq
+#   Phase 1 — parallel: download each FTP/SFTP source into its own subdir
+#              (local sources are skipped — no copy performed)
+#   Phase 2 — serial: walk staged files (remote) or original paths (local)
+#              and add to zpaq
 # ============================================================
 run_parallel_downloads() {
     local -a source_dirs=()
 
-    # Assign each source a dedicated staging subdirectory
+    # Assign each source a dedicated staging subdirectory.
+    # Local sources get an empty string — they are never staged.
     local i
     for (( i = 0; i < ${#SOURCES[@]}; i++ )); do
-        source_dirs+=("${STAGE_DIR}/src_${i}")
-        mkdir -p "${STAGE_DIR}/src_${i}"
+        local src="${SOURCES[${i}]}"
+        case "${src}" in
+            ftp://*|sftp://*)
+                source_dirs+=("${STAGE_DIR}/src_${i}")
+                mkdir -p "${STAGE_DIR}/src_${i}"
+                ;;
+            *)
+                # Local path — no staging directory needed
+                source_dirs+=("")
+                ;;
+        esac
     done
 
-    # Phase 1: parallel downloads
+    # Phase 1: parallel downloads (remote sources only)
     local -a dl_pids=()
     for (( i = 0; i < ${#SOURCES[@]}; i++ )); do
         local src="${SOURCES[${i}]}"
         local src_dir="${source_dirs[${i}]}"
+
+        # Skip local sources — nothing to download
+        [[ -z "${src_dir}" ]] && continue
+
         log "INFO" "Launching download worker ${i} for: ${src}"
 
         (
-            # Each worker runs in a subshell with its own staging dir
             case "${src}" in
                 ftp://*)
                     resolve_credentials "${src}"
@@ -449,18 +390,6 @@ run_parallel_downloads() {
                     sftp_download_url "${src}" \
                         "${RESOLVED_USER}" "${RESOLVED_PASS}" "${src_dir}" \
                         || exit 1
-                    ;;
-                *)
-                    # Local path: just copy into src_dir preserving structure
-                    if [[ -d "${src}" ]]; then
-                        rsync -a "${src}/" "${src_dir}/" 2>/dev/null \
-                            || cp -a "${src}/." "${src_dir}/"
-                    elif [[ -f "${src}" ]]; then
-                        cp -p "${src}" "${src_dir}/"
-                    else
-                        echo "ERROR: local source not found: ${src}" >&2
-                        exit 1
-                    fi
                     ;;
             esac
         ) &
@@ -488,10 +417,34 @@ run_parallel_downloads() {
     # on the same archive)
     log "INFO" "All downloads complete — adding files to archive (serial)"
     for (( i = 0; i < ${#SOURCES[@]}; i++ )); do
+        local src="${SOURCES[${i}]}"
         local src_dir="${source_dirs[${i}]}"
-        local f
+        local walk_root f
+
+        if [[ -n "${src_dir}" ]]; then
+            # Remote source — walk the staging directory
+            walk_root="${src_dir}"
+        else
+            # Local source — walk the original path directly (no copy)
+            if [[ ! -e "${src}" ]]; then
+                log "ERROR" "Local source not found: ${src}"
+                all_ok=false
+                continue
+            fi
+            if [[ -f "${src}" ]]; then
+                # Single local file — add directly, no directory walk needed
+                local prefix=""
+                if ! zpaq_add_source "${ZPAQ_FILE}" "${prefix}" "${src}" "${TEMP_DIR}"; then
+                    log "ERROR" "Failed to add to archive: ${src}"
+                    all_ok=false
+                fi
+                continue
+            fi
+            walk_root="${src}"
+        fi
+
         while IFS= read -r f; do
-            local rel="${f#"${src_dir}"/}"
+            local rel="${f#"${walk_root}"/}"
             local prefix
             prefix=$(dirname "${rel}")
             [[ "${prefix}" == "." ]] && prefix=""
@@ -499,7 +452,7 @@ run_parallel_downloads() {
                 log "ERROR" "Failed to add to archive: ${f}"
                 all_ok=false
             fi
-        done < <(find "${src_dir}" -type f | sort)
+        done < <(find "${walk_root}" -type f | sort)
     done
 
     [[ "${all_ok}" == true ]]
