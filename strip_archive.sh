@@ -343,7 +343,7 @@ decompress_to_tar() {
             ;;
         *.tar.xz|*.txz)
             log "DEBUG" "Using xz"
-            xz -d -k -c "${OPT_ARCHIVE}" > "${STAGING_TAR}" || rc=$?
+            xz -d -k -c -T "${OPT_XZ_THREADS:-2}" "${OPT_ARCHIVE}" > "${STAGING_TAR}" || rc=$?
             ;;
     esac
 

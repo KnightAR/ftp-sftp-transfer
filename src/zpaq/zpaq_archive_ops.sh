@@ -18,9 +18,14 @@
 #       zpaq_add_local_file() instead — see zpaq_add_container().
 #       Returns 0 on success, 1 on error.
 #
-#   zpaq_add_stdin ARCHIVE INTERNAL_NAME
+#   zpaq_add_stdin ARCHIVE INTERNAL_NAME [FILE_SIZE_HINT]
 #       Reads from stdin and adds the content to ARCHIVE as INTERNAL_NAME
 #       using zpaqfranz a ... -stdin.  Returns 0 on success, 1 on error.
+#       FILE_SIZE_HINT is an optional third argument (uncompressed bytes,
+#       plain integer).  When ZPAQ_STDINSIZE_HINT=true and the hint is
+#       non-empty/non-zero, -stdinsize is passed to zpaqfranz so it can
+#       display real % progress instead of throughput-only output.
+#       Requires a zpaqfranz build with the -stdinsize patch (v64.6+).
 #       MUST NOT be called from inside $(...) — uses log().
 #
 #   zpaq_add_local_file ARCHIVE INTERNAL_NAME LOCAL_FILE
@@ -54,6 +59,13 @@
 
 # ARCHIVE_FORMAT is set by detect_archive_format() — readable by callers.
 ARCHIVE_FORMAT=""
+
+# ZPAQ_STDINSIZE_HINT — when "true", zpaq_add_stdin() passes -stdinsize <N> to
+# zpaqfranz so the progress bar shows real % completion.
+# Requires a patched zpaqfranz that supports -stdinsize (our patch v64.6+).
+# Disabled by default for compatibility with unpatched zpaqfranz builds.
+# Set via config file: ZPAQ_STDINSIZE_HINT="true"
+ZPAQ_STDINSIZE_HINT="${ZPAQ_STDINSIZE_HINT:-false}"
 
 # ---------------------------------------------------------------------------
 # detect_archive_format FILEPATH
@@ -155,7 +167,7 @@ decompress_to_stdout() {
         bz2)
             bzip2 -dc "${filepath}"  ;;
         xz)
-            xz    -dc "${filepath}"  ;;
+            xz -dc -T "${XZ_DECOMPRESS_THREADS:-4}" "${filepath}"  ;;
         zst)
             zstd  -dc "${filepath}"  ;;
         tar|tar_gz|tar_bz2|tar_xz|tar_zst|zip|7z)
@@ -170,14 +182,21 @@ decompress_to_stdout() {
 }
 
 # ---------------------------------------------------------------------------
-# zpaq_add_stdin ARCHIVE INTERNAL_NAME
+# zpaq_add_stdin ARCHIVE INTERNAL_NAME [FILE_SIZE_HINT]
 #
 # Reads from stdin and adds it to ARCHIVE as INTERNAL_NAME.
 # Uses: zpaqfranz a <archive> <internal_name> -stdin -m5 -ssd -threads N
 #
-# -m5         compression level 5 (balanced)
-# -ssd        SSD-optimised I/O scheduler
-# -threads N  thread count from ZPAQFRANZ_THREADS (set by zpaq_calc_threads())
+# -m5              compression level 5 (balanced)
+# -ssd             SSD-optimised I/O scheduler
+# -threads N       thread count from ZPAQFRANZ_THREADS (set by zpaq_calc_threads())
+# -stdinsize N     (optional) uncompressed byte-size hint for % progress bar.
+#                  Only passed when FILE_SIZE_HINT is non-empty AND
+#                  ZPAQ_STDINSIZE_HINT=true.  Requires a zpaqfranz build that
+#                  includes the -stdinsize patch (v64.6+).
+#
+# FILE_SIZE_HINT   optional third argument: expected uncompressed size in bytes
+#                  (plain integer, no suffix).  Pass "" or omit to disable.
 #
 # Returns 0 on success, 1 on error.
 # MUST NOT be called from inside $(...) — uses log().
@@ -185,11 +204,22 @@ decompress_to_stdout() {
 zpaq_add_stdin() {
     local archive="$1"
     local internal_name="$2"
+    local file_size_hint="${3:-}"   # optional: uncompressed bytes (integer string)
 
     # Use ZPAQFRANZ_THREADS if set; fall back to 1 if not yet initialised
     local threads="${ZPAQFRANZ_THREADS:-1}"
 
-    log "INFO" "zpaq_add_stdin: adding '${internal_name}' → ${archive} (threads=${threads})"
+    # Build optional -stdinsize flag.
+    # Only emit it when the feature is enabled AND a non-zero hint was supplied.
+    local stdinsize_args=()
+    if [[ "${ZPAQ_STDINSIZE_HINT:-false}" == "true" \
+          && -n "${file_size_hint}" \
+          && "${file_size_hint}" != "0" ]]; then
+        stdinsize_args=( -stdinsize "${file_size_hint}" )
+        log "INFO" "zpaq_add_stdin: adding '${internal_name}' → ${archive} (threads=${threads}, stdinsize=${file_size_hint})"
+    else
+        log "INFO" "zpaq_add_stdin: adding '${internal_name}' → ${archive} (threads=${threads})"
+    fi
 
     # zpaqfranz writes progress to stderr (terminal) and may write to stdout.
     # Stdout is tee'd to LOG_FILE so it appears in the log and on the terminal.
@@ -198,6 +228,7 @@ zpaq_add_stdin() {
     local rc=0
     "${ZPAQFRANZ_BIN}" a "${archive}" "${internal_name}" \
         -stdin -m5 -ssd -threads "${threads}" \
+        "${stdinsize_args[@]}" \
         | tee -a "${LOG_FILE:-/dev/null}"
     rc="${PIPESTATUS[0]}"
 
@@ -216,6 +247,10 @@ zpaq_add_stdin() {
 # Adds LOCAL_FILE to ARCHIVE as INTERNAL_NAME by piping its content through
 # zpaqfranz a ... -stdin.
 #
+# When ZPAQ_STDINSIZE_HINT=true, the file size is obtained via stat(1) and
+# forwarded to zpaq_add_stdin() as FILE_SIZE_HINT so zpaqfranz can display
+# a real % progress bar instead of throughput-only output.
+#
 # Returns 0 on success, 1 on error.
 # ---------------------------------------------------------------------------
 zpaq_add_local_file() {
@@ -228,8 +263,14 @@ zpaq_add_local_file() {
         return 1
     fi
 
+    # Obtain file size for -stdinsize hint when the feature is enabled.
+    local size_hint=""
+    if [[ "${ZPAQ_STDINSIZE_HINT:-false}" == "true" ]]; then
+        size_hint=$(stat -c "%s" "${local_file}" 2>/dev/null || echo "")
+    fi
+
     log "DEBUG" "zpaq_add_local_file: piping '${local_file}' as '${internal_name}'"
-    cat "${local_file}" | zpaq_add_stdin "${archive}" "${internal_name}"
+    cat "${local_file}" | zpaq_add_stdin "${archive}" "${internal_name}" "${size_hint}"
 }
 
 # ---------------------------------------------------------------------------
@@ -383,11 +424,33 @@ zpaq_add_source() {
                 log "INFO" "zpaq_add_source: already in archive, skipping: ${internal_name}"
                 return 0
             fi
+            # Obtain decompressed size hint for % progress bar when enabled.
+            # xz/zst store the original size in their headers (no full read needed).
+            # gz/bz2 have no reliable header field for >4 GB, so we skip the hint
+            # for those formats to avoid a costly full-stream read.
+            local decomp_size_hint=""
+            if [[ "${ZPAQ_STDINSIZE_HINT:-false}" == "true" ]]; then
+                case "${ARCHIVE_FORMAT}" in
+                    xz)
+                        decomp_size_hint=$(xz -l --robot "${filepath}" 2>/dev/null \
+                            | awk '$1=="file" { print $5; exit }' || echo "")
+                        ;;
+                    zst)
+                        decomp_size_hint=$(zstd -l "${filepath}" 2>/dev/null \
+                            | awk 'NR>1 { gsub(/,/,"",$3); print $3; exit }' || echo "")
+                        ;;
+                    gz|bz2)
+                        # No reliable cheap header read for large files; skip hint.
+                        decomp_size_hint=""
+                        ;;
+                esac
+            fi
             decompress_to_stdout "${filepath}" "${ARCHIVE_FORMAT}" \
-                | zpaq_add_stdin "${archive}" "${internal_name}"
+                | zpaq_add_stdin "${archive}" "${internal_name}" "${decomp_size_hint}"
             ;;
         plain|*)
-            # Raw file: check existence, then pipe directly
+            # Raw file: check existence, then pipe directly.
+            # zpaq_add_local_file() will stat the file itself when the hint is enabled.
             if zpaq_file_exists "${archive}" "${internal_name}"; then
                 log "INFO" "zpaq_add_source: already in archive, skipping: ${internal_name}"
                 return 0

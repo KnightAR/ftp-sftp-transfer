@@ -206,6 +206,10 @@ load_multi_config() {
     : "${ZPAQ_THREADS:=}"
     : "${ZPAQ_COMPRESSION:=-m5}"
     : "${ZPAQ_EXTRA_FLAGS:=-ssd}"
+    # Set to "true" to pass -stdinsize to zpaqfranz for % progress on stdin adds.
+    # Requires a zpaqfranz build with the -stdinsize patch (v64.6+).
+    # Disabled by default for compatibility with unpatched zpaqfranz builds.
+    : "${ZPAQ_STDINSIZE_HINT:=false}"
 
     # Multipart
     : "${ZPAQ_MULTIPART_QUESTION_MARKS:=7}"

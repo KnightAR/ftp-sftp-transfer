@@ -480,6 +480,7 @@ Fields:
 | `SFTP_PORT` | `22` | SFTP port |
 | `ZPAQ_COMPRESSION` | `-m5` | zpaqfranz compression level flag |
 | `ZPAQ_EXTRA_FLAGS` | `-ssd` | Additional zpaqfranz flags |
+| `ZPAQ_STDINSIZE_HINT` | `false` | When `true`, passes `-stdinsize <N>` to zpaqfranz so the progress bar shows real % completion instead of throughput-only. Requires a zpaqfranz build with the `-stdinsize` patch (v64.6+). Safe to leave `false` with unpatched builds. |
 | `ZPAQ_FRAGMENT` | `3` | CDC fragment exponent (locked per archive on first add) |
 | `ZPAQ_MULTIPART_QUESTION_MARKS` | `7` | Number of `?` in archive pattern (supports up to 9,999,999 parts) |
 | `XZ_DECOMPRESS_THREADS` | `4` | Thread count for `xz -d -T` |
