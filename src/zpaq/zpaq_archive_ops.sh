@@ -62,10 +62,9 @@ ARCHIVE_FORMAT=""
 
 # ZPAQ_STDINSIZE_HINT — when "true", zpaq_add_stdin() passes -stdinsize <N> to
 # zpaqfranz so the progress bar shows real % completion.
-# Requires a patched zpaqfranz that supports -stdinsize (our patch v64.6+).
-# Disabled by default for compatibility with unpatched zpaqfranz builds.
-# Set via config file: ZPAQ_STDINSIZE_HINT="true"
-ZPAQ_STDINSIZE_HINT="${ZPAQ_STDINSIZE_HINT:-false}"
+# Requires zpaqfranz >= v64.7 (upstream release, 2026-03-26).
+# Set via config file: ZPAQ_STDINSIZE_HINT="false" to disable.
+ZPAQ_STDINSIZE_HINT="${ZPAQ_STDINSIZE_HINT:-true}"
 
 # ---------------------------------------------------------------------------
 # detect_archive_format FILEPATH
@@ -192,8 +191,7 @@ decompress_to_stdout() {
 # -threads N       thread count from ZPAQFRANZ_THREADS (set by zpaq_calc_threads())
 # -stdinsize N     (optional) uncompressed byte-size hint for % progress bar.
 #                  Only passed when FILE_SIZE_HINT is non-empty AND
-#                  ZPAQ_STDINSIZE_HINT=true.  Requires a zpaqfranz build that
-#                  includes the -stdinsize patch (v64.6+).
+#                  ZPAQ_STDINSIZE_HINT=true.  Requires zpaqfranz >= v64.7.
 #
 # FILE_SIZE_HINT   optional third argument: expected uncompressed size in bytes
 #                  (plain integer, no suffix).  Pass "" or omit to disable.
@@ -436,8 +434,16 @@ zpaq_add_source() {
                             | awk '$1=="file" { print $5; exit }' || echo "")
                         ;;
                     zst)
-                        decomp_size_hint=$(zstd -l "${filepath}" 2>/dev/null \
-                            | awk 'NR>1 { gsub(/,/,"",$3); print $3; exit }' || echo "")
+                        # zstd -lv prints "Decompressed Size: X KiB (N B)" when the
+                        # frame contains a content-size field (files compressed from a
+                        # named source).  Extract the parenthesised byte integer.
+                        # Falls back to "" for stdin-compressed frames (no field stored).
+                        decomp_size_hint=$(zstd -lv "${filepath}" 2>/dev/null \
+                            | awk '/Decompressed Size:/ {
+                                match($0, /\(([0-9]+) B\)/, a)
+                                if (a[1] != "") print a[1]
+                                exit
+                            }' || echo "")
                         ;;
                     gz|bz2)
                         # No reliable cheap header read for large files; skip hint.

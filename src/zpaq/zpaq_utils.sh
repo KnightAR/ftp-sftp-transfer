@@ -34,22 +34,42 @@ ZPAQFRANZ_THREADS=1
 
 # detect_zpaqfranz
 #
-# Locates the zpaqfranz binary and sets ZPAQFRANZ_BIN.
-# Exits with a clear install hint if not found.
+# Locates the zpaqfranz binary, sets ZPAQFRANZ_BIN, and checks the version.
+# If the installed binary is older than v64.7 (the first upstream release that
+# includes -stdinsize), ZPAQ_STDINSIZE_HINT is forced to "false" and a warning
+# is logged so the operator knows why progress % is not shown.
+# Exits with a clear install hint if zpaqfranz is not found at all.
 detect_zpaqfranz() {
-    if command -v zpaqfranz &>/dev/null; then
-        ZPAQFRANZ_BIN=$(command -v zpaqfranz)
-        log "DEBUG" "zpaqfranz found: ${ZPAQFRANZ_BIN}"
-        return 0
+    if ! command -v zpaqfranz &>/dev/null; then
+        echo "ERROR: zpaqfranz is required but not found on PATH." >&2
+        echo "       Build from source:" >&2
+        echo "         wget https://github.com/fcorbelli/zpaqfranz/archive/refs/tags/64.7.tar.gz" >&2
+        echo "         tar xzf 64.7.tar.gz && cd zpaqfranz-64.7/NONWINDOWS" >&2
+        echo "         make && sudo cp zpaqfranz /usr/local/bin/" >&2
+        echo "       Or on Debian 13+: sudo apt-get install zpaqfranz" >&2
+        exit 2
     fi
 
-    echo "ERROR: zpaqfranz is required but not found on PATH." >&2
-    echo "       Build from source:" >&2
-    echo "         wget https://github.com/fcorbelli/zpaqfranz/archive/refs/tags/64.6.tar.gz" >&2
-    echo "         tar xzf 64.6.tar.gz && cd zpaqfranz-64.6/NONWINDOWS" >&2
-    echo "         make && sudo cp zpaqfranz /usr/local/bin/" >&2
-    echo "       Or on Debian 13+: sudo apt-get install zpaqfranz" >&2
-    exit 2
+    ZPAQFRANZ_BIN=$(command -v zpaqfranz)
+    log "DEBUG" "zpaqfranz found: ${ZPAQFRANZ_BIN}"
+
+    # Parse the version from the first line of "zpaqfranz" with no arguments.
+    # Example: "zpaqfranz v64.7g-JIT,SFTP-L,HW SHA1/2,4,(2026-03-24)"
+    # Extract the major.minor digits immediately after "v" and compare as an
+    # integer (major*1000 + minor) against 64007 (== v64.7).
+    local ver_string ver_num
+    ver_string=$("${ZPAQFRANZ_BIN}" 2>&1 | awk 'NR==1 { match($0, /v([0-9]+\.[0-9]+)/, a); print a[1]; exit }')
+    ver_num=$(awk -v v="${ver_string}" 'BEGIN {
+        split(v, p, ".")
+        print (p[1] != "" ? p[1]*1000 + p[2] : 0)
+    }')
+
+    log "DEBUG" "zpaqfranz version string: ${ver_string}  (numeric: ${ver_num})"
+
+    if (( ver_num > 0 && ver_num < 64007 )); then
+        log "WARN" "zpaqfranz ${ver_string} is older than v64.7; -stdinsize is not supported. Forcing ZPAQ_STDINSIZE_HINT=false."
+        ZPAQ_STDINSIZE_HINT="false"
+    fi
 }
 
 # zpaq_file_exists ARCHIVE INTERNAL_NAME
