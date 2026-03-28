@@ -16,15 +16,25 @@ Three scripts for building and storing `.zpaq` archives — either a single grow
 
 ### Installing zpaqfranz
 
-```bash
-# Build from source
-wget https://github.com/fcorbelli/zpaqfranz/archive/refs/tags/64.6.tar.gz
-tar xzf 64.6.tar.gz && cd zpaqfranz-64.6/NONWINDOWS
-make && sudo cp zpaqfranz /usr/local/bin/
+Use the included helper script to download, compile, and install the latest release:
 
-# Or on Debian 13+
+```bash
+sudo ./scripts/install_zpaqfranz.sh            # latest release (SFTP enabled)
+sudo ./scripts/install_zpaqfranz.sh 64.7       # pin to a specific version
+sudo ./scripts/install_zpaqfranz.sh --no-sftp  # build without SFTP (no libssh-4 runtime dep)
+sudo ./scripts/install_zpaqfranz.sh --static   # fully static binary, no SFTP
+sudo ./scripts/install_zpaqfranz.sh --dry-run  # preview steps without executing
+```
+
+The script installs to `/usr/local/bin/zpaqfranz` (override with `--prefix DIR`) and creates a `dir` symlink alongside it. It requires `g++`, `make`, and `wget` — installed automatically via apt if missing. On re-runs with the same version the cached source tarball is reused.
+
+Alternatively, on Debian 13+ / Ubuntu 25.04+:
+
+```bash
 sudo apt-get install zpaqfranz
 ```
+
+> **Note:** The apt package may lag behind the latest release. The helper script always pulls the current GitHub release and is the recommended path for v64.7+.
 
 ---
 
@@ -501,8 +511,11 @@ Written to `<ZPAQ_LOCAL_DIR>/logs/<basename>_multi_YYYYMMDD_HHMMSS.log`, appende
 ### Dependencies
 
 ```bash
+# Build and install zpaqfranz from source (see "Installing zpaqfranz" above)
+sudo ./scripts/install_zpaqfranz.sh
+
 # Required
-sudo apt-get install -y zpaqfranz sshpass openssh-client xz-utils
+sudo apt-get install -y sshpass openssh-client xz-utils
 
 # Recommended (parallel decompressors)
 sudo apt-get install -y lbzip2 pigz
@@ -510,7 +523,7 @@ sudo apt-get install -y lbzip2 pigz
 # For .zip sources
 sudo apt-get install -y unzip
 
-# Fallback bz2 decompressors (used if lbzip2 not found)
+# Fallback bz2 decompressor (used if lbzip2 not found)
 sudo apt-get install -y pbzip2
 ```
 

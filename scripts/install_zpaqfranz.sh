@@ -4,14 +4,14 @@
 # the latest zpaqfranz release on a Debian/Ubuntu system.
 #
 # Usage:
-#   sudo ./scripts/install_zpaqfranz.sh            # latest release
+#   sudo ./scripts/install_zpaqfranz.sh            # latest release (SFTP enabled)
 #   sudo ./scripts/install_zpaqfranz.sh 64.7       # specific version
-#   sudo ./scripts/install_zpaqfranz.sh --sftp     # build with SFTP support
+#   sudo ./scripts/install_zpaqfranz.sh --no-sftp  # build without SFTP
 #
 # Options:
 #   VERSION        Optional positional argument: tag to install (e.g. 64.7).
 #                  Defaults to the latest GitHub release.
-#   --sftp         Build with SFTP support (requires libssh-4 at runtime).
+#   --no-sftp      Build without SFTP support (no libssh-4 runtime dep).
 #   --static       Static binary (no SFTP, no -ldl; good for containers).
 #   --jobs N       Parallel compile jobs (default: nproc).
 #   --prefix DIR   Install prefix (default: /usr/local).
@@ -44,7 +44,7 @@ set -euo pipefail
 # Defaults
 # ---------------------------------------------------------------------------
 ZPAQFRANZ_VERSION=""          # empty = fetch latest from GitHub API
-ENABLE_SFTP="no"
+ENABLE_SFTP="yes"
 BUILD_STATIC="no"
 JOBS=$(nproc 2>/dev/null || echo 2)
 PREFIX="/usr/local"
@@ -82,7 +82,7 @@ run()   {
 # ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --sftp)       ENABLE_SFTP="yes"; shift ;;
+        --no-sftp)    ENABLE_SFTP="no";  shift ;;
         --static)     BUILD_STATIC="yes"; shift ;;
         --keep-build) KEEP_BUILD="yes";  shift ;;
         --dry-run)    DRY_RUN="yes";     shift ;;
@@ -271,7 +271,7 @@ step "Verifying installed binary"
 if [[ "${DRY_RUN}" != "yes" ]]; then
     INSTALLED_LINE=$("${BINDIR}/zpaqfranz" 2>&1 | head -1 || true)
     INSTALLED_VER=$(echo "${INSTALLED_LINE}" \
-        | awk 'match($0, /v([0-9]+\.[0-9]+)/, a) { print a[1] }')
+        | awk '{ s = $0; sub(/.*v/, "", s); sub(/[^0-9.].*/, "", s); print s }')
 
     if [[ -z "${INSTALLED_VER}" ]]; then
         warn "Could not parse version from binary output: ${INSTALLED_LINE}"
@@ -281,7 +281,7 @@ if [[ "${DRY_RUN}" != "yes" ]]; then
         # Warn if the binary version doesn't match what we built
         # (e.g. PATH shadowed by an older system binary)
         CANONICAL_VER=$(echo "${ZPAQFRANZ_VERSION}" \
-            | awk 'match($0, /([0-9]+\.[0-9]+)/, a) { print a[1] }')
+            | awk '{ s = $0; sub(/[^0-9]*/, "", s); sub(/[^0-9.].*/, "", s); print s }')
         if [[ "${INSTALLED_VER}" != "${CANONICAL_VER}" ]]; then
             warn "Version mismatch: binary reports ${INSTALLED_VER}, expected ${CANONICAL_VER}"
             warn "Check that ${BINDIR} is earlier in PATH than any other zpaqfranz installation."

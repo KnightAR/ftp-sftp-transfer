@@ -58,7 +58,7 @@ detect_zpaqfranz() {
     # Extract the major.minor digits immediately after "v" and compare as an
     # integer (major*1000 + minor) against 64007 (== v64.7).
     local ver_string ver_num
-    ver_string=$("${ZPAQFRANZ_BIN}" 2>&1 | awk 'NR==1 { match($0, /v([0-9]+\.[0-9]+)/, a); print a[1]; exit }')
+    ver_string=$("${ZPAQFRANZ_BIN}" 2>&1 | awk 'NR==1 { s = $0; sub(/.*v/, "", s); sub(/[^0-9.].*/, "", s); print s; exit }')
     ver_num=$(awk -v v="${ver_string}" 'BEGIN {
         split(v, p, ".")
         print (p[1] != "" ? p[1]*1000 + p[2] : 0)
