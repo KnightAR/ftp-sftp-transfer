@@ -415,14 +415,17 @@ remote_file_exists() {
 
     log "DEBUG" "remote_file_exists: checking ${remote_dir}/${remote_name}"
 
-    local listing rc=0
+    local batch_file listing rc=0
+    batch_file=$(mktemp /tmp/_zpaq_sftp_batch.XXXXXX)
+    printf 'ls -1 %s\n' "${remote_dir}" > "${batch_file}"
     listing=$(SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                 -o StrictHostKeyChecking=no \
                 -o BatchMode=no \
                 -P "${SFTP_PORT}" \
                 "${SFTP_USER}@${SFTP_HOST}" \
-                -b <(printf 'ls -1 %s\n' "${remote_dir}") \
+                -b "${batch_file}" \
                 2>/dev/null) || rc=$?
+    rm -f "${batch_file}"
 
     if (( rc != 0 )); then
         log "DEBUG" "remote_file_exists: ls failed (rc=${rc}) — treating as absent"
