@@ -190,9 +190,9 @@ expand_sftp_wildcard() {
     listing=$(SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                 -o StrictHostKeyChecking=no \
                 -o BatchMode=no \
+                -b <(printf 'ls -1 %s\n' "${remote_dir}") \
                 -P "${SFTP_PORT}" \
                 "${SFTP_USER}@${SFTP_HOST}" \
-                -b <(printf 'ls -1 %s\n' "${remote_dir}") \
                 2>/dev/null) || rc=$?
 
     if (( rc != 0 )); then

@@ -65,9 +65,9 @@ _sftp_dl_run() {
         -o ConnectTimeout=10 \
         -o ServerAliveInterval=15 \
         -o ServerAliveCountMax=3 \
+        -b <(printf '%s\n' "${batch_cmds}") \
         -P "${port}" \
         "${user}@${host}" \
-        -b <(printf '%s\n' "${batch_cmds}") \
         2>/dev/null
 }
 

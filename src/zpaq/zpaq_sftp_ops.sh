@@ -55,8 +55,6 @@
 _zpaq_sftp_run() {
     local batch_cmds="$1"
 
-    log "DEBUG" "_zpaq_sftp_run: [${SFTP_USER}@${SFTP_HOST}:${SFTP_PORT}] cmd=[${batch_cmds}]"
-
     local rc=0
     local line
     while IFS= read -r line; do
@@ -64,9 +62,9 @@ _zpaq_sftp_run() {
     done < <(SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                 -o StrictHostKeyChecking=no \
                 -o BatchMode=no \
+                -b <(printf '%s\n' "${batch_cmds}") \
                 -P "${SFTP_PORT}" \
                 "${SFTP_USER}@${SFTP_HOST}" \
-                -b <(printf '%s\n' "${batch_cmds}") \
                 2>&1) || rc=$?
 
     return "${rc}"
@@ -159,9 +157,9 @@ zpaq_sftp_prune_backups() {
     listing=$(SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                 -o StrictHostKeyChecking=no \
                 -o BatchMode=no \
+                -b <(printf 'ls -1 %s\n' "${remote_dir}") \
                 -P "${SFTP_PORT}" \
                 "${SFTP_USER}@${SFTP_HOST}" \
-                -b <(printf 'ls -1 %s\n' "${remote_dir}") \
                 2>/dev/null) || rc=$?
 
     if (( rc != 0 )); then
