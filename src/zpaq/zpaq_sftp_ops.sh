@@ -55,29 +55,19 @@
 _zpaq_sftp_run() {
     local batch_cmds="$1"
 
-    # sshpass closes all non-standard file descriptors before exec-ing sftp
-    # (security measure to prevent fd leakage). This means process substitution
-    # fds (-b <(printf ...)) are closed before sftp can read them, causing sftp
-    # to print its usage message. Use a real temp file instead.
-    local batch_file rc=0
-    batch_file=$(mktemp /tmp/_zpaq_sftp_batch.XXXXXX)
-    printf '%s\n' "${batch_cmds}" > "${batch_file}"
+    log "DEBUG" "_zpaq_sftp_run: [${SFTP_USER}@${SFTP_HOST}:${SFTP_PORT}] cmd=[${batch_cmds}]"
 
-    local output
-    output=$(SSHPASS="${SFTP_PASS}" sshpass -e sftp \
+    local rc=0
+    local line
+    while IFS= read -r line; do
+        log "DEBUG" "sftp: ${line}"
+    done < <(SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                 -o StrictHostKeyChecking=no \
                 -o BatchMode=no \
                 -P "${SFTP_PORT}" \
                 "${SFTP_USER}@${SFTP_HOST}" \
-                -b "${batch_file}" \
+                -b <(printf '%s\n' "${batch_cmds}") \
                 2>&1) || rc=$?
-
-    rm -f "${batch_file}"
-
-    local line
-    while IFS= read -r line; do
-        log "DEBUG" "sftp: ${line}"
-    done <<< "${output}"
 
     return "${rc}"
 }
@@ -165,19 +155,14 @@ zpaq_sftp_prune_backups() {
     log "DEBUG" "zpaq_sftp_prune_backups: listing ${remote_dir}/${base}.*.zpaq (keep=${keep_count})"
 
     # List the remote directory and filter for timestamped backup names
-    # Use a temp file for the batch command — sshpass closes all non-standard fds
-    # before exec-ing sftp, which breaks -b <(printf ...) process substitutions.
-    local batch_file listing rc=0
-    batch_file=$(mktemp /tmp/_zpaq_sftp_batch.XXXXXX)
-    printf 'ls -1 %s\n' "${remote_dir}" > "${batch_file}"
+    local listing rc=0
     listing=$(SSHPASS="${SFTP_PASS}" sshpass -e sftp \
                 -o StrictHostKeyChecking=no \
                 -o BatchMode=no \
                 -P "${SFTP_PORT}" \
                 "${SFTP_USER}@${SFTP_HOST}" \
-                -b "${batch_file}" \
+                -b <(printf 'ls -1 %s\n' "${remote_dir}") \
                 2>/dev/null) || rc=$?
-    rm -f "${batch_file}"
 
     if (( rc != 0 )); then
         log "WARN" "zpaq_sftp_prune_backups: could not list remote dir (rc=${rc}): ${remote_dir}"
