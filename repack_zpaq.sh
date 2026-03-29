@@ -344,10 +344,12 @@ setup_temp_dirs() {
     REPACK_QUEUE_DIR="${REPACK_TEMP_DIR}/queue"
     REPACK_QUEUE_SENTINEL="${REPACK_QUEUE_DIR}/DONE_SENTINEL"
 
+    # Create the root temp dir and queue dir before mktemp runs
+    mkdir -p "${REPACK_TEMP_DIR}" "${REPACK_QUEUE_DIR}"
+
     # Ephemeral verify dir: unique per run (holds transient download files)
     REPACK_VERIFY_DIR=$(mktemp -d "${REPACK_TEMP_DIR}/verify_$$.XXXXXX")
 
-    mkdir -p "${REPACK_QUEUE_DIR}" "${REPACK_VERIFY_DIR}"
     log "INFO" "setup_temp_dirs: queue=${REPACK_QUEUE_DIR} verify=${REPACK_VERIFY_DIR}"
 }
 
