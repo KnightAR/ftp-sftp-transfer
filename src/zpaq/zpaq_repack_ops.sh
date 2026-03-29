@@ -448,7 +448,8 @@ ensure_remote_dir() {
 }
 
 # upload_one_file LOCAL_BZ2_PATH SHA256_PATH REMOTE_DIR REMOTE_NAME
-# Atomic SFTP upload: put → re-download → sha256 verify → rename.
+# SFTP upload: put directly to final name → re-download → sha256 verify.
+# No rename step — OVH PCA SFTP does not support rename.
 # Returns 0 on success, 1 on any failure.
 upload_one_file() {
     local local_bz2_path="$1"
@@ -456,7 +457,6 @@ upload_one_file() {
     local remote_dir="$3"
     local remote_name="$4"
 
-    local remote_tmp="${remote_dir}/${remote_name}.tmp_upload"
     local remote_final="${remote_dir}/${remote_name}"
     local verify_file="${REPACK_VERIFY_DIR}/${remote_name}.verify"
 
@@ -469,21 +469,20 @@ upload_one_file() {
         return 1
     fi
 
-    # Step 1: upload to .tmp_upload
+    # Step 1: upload directly to final name
     local rc=0
-    _zpaq_sftp_run "put ${local_bz2_path} ${remote_tmp}" || rc=$?
+    _zpaq_sftp_run "put ${local_bz2_path} ${remote_final}" || rc=$?
     if (( rc != 0 )); then
-        log "ERROR" "upload_one_file: upload to tmp failed (rc=${rc})"
+        log "ERROR" "upload_one_file: upload failed (rc=${rc})"
         return 1
     fi
 
     # Step 2: re-download for verification
     rm -f "${verify_file}"
     rc=0
-    _zpaq_sftp_run "get ${remote_tmp} ${verify_file}" || rc=$?
+    _zpaq_sftp_run "get ${remote_final} ${verify_file}" || rc=$?
     if (( rc != 0 )) || [[ ! -f "${verify_file}" ]]; then
         log "ERROR" "upload_one_file: re-download failed (rc=${rc})"
-        _zpaq_sftp_run "rm ${remote_tmp}" || true
         rm -f "${verify_file}"
         return 1
     fi
@@ -497,19 +496,9 @@ upload_one_file() {
         log "ERROR" "upload_one_file: sha256 mismatch for ${remote_name}"
         log "ERROR" "  expected: ${expected_hash}"
         log "ERROR" "  got:      ${actual_hash}"
-        _zpaq_sftp_run "rm ${remote_tmp}" || true
         return 1
     fi
     log "DEBUG" "upload_one_file: sha256 OK"
-
-    # Step 4: rename to final
-    rc=0
-    _zpaq_sftp_run "rename ${remote_tmp} ${remote_final}" || rc=$?
-    if (( rc != 0 )); then
-        log "ERROR" "upload_one_file: rename failed (rc=${rc})"
-        _zpaq_sftp_run "rm ${remote_tmp}" || true
-        return 1
-    fi
 
     log "INFO" "upload_one_file: OK ${remote_final}"
     return 0
