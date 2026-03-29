@@ -353,6 +353,7 @@ compress_one_file() {
     fi
 
     local rc_pbzip2 rc_tee
+    local -a _pipe_status
     set +e
     pbzip2 -9 -c \
         "${pbzip2_threads_arg[@]}" \
@@ -361,9 +362,10 @@ compress_one_file() {
         "${extracted_file}" \
         | tee >(sha256sum > "${tmp_sha}") \
         > "${tmp_bz2}"
-    rc_pbzip2="${PIPESTATUS[0]}"
-    rc_tee="${PIPESTATUS[1]}"
+    _pipe_status=( "${PIPESTATUS[@]}" )   # capture whole array before -u clobbers it
     set -e
+    rc_pbzip2="${_pipe_status[0]:-1}"
+    rc_tee="${_pipe_status[1]:-1}"
 
     if (( rc_pbzip2 != 0 || rc_tee != 0 )); then
         log "ERROR" "compress_one_file: pipeline failed (rc_pbzip2=${rc_pbzip2} rc_tee=${rc_tee}) for ${bz2_basename}"
