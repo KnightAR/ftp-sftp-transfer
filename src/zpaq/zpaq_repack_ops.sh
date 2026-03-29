@@ -100,21 +100,41 @@ _REPACK_QUEUE_COUNTER=0
 # Multipart archives: ZPAQ_PATTERN may contain "???????" wildcards and is
 # passed directly to zpaqfranz, which handles multipart internally.
 #
+# IMPORTANT: This function is called inside $(...) by the main loop, so
+# stdout is captured by the caller. Per the logging.sh convention for
+# functions called inside $(), log() must NOT be used here — it writes
+# to stdout which would be captured into the variable. Instead, progress
+# is written directly to ${LOG_FILE} and echoed to stderr.
+#
 # Returns 0 on success, 1 if zpaqfranz fails or produces no output.
 # ---------------------------------------------------------------------------
+
+# _list_log LEVEL MESSAGE
+# Internal helper for list_zpaq_files(): writes directly to LOG_FILE +
+# stderr instead of stdout, safe for use inside $(...) subshells.
+_list_log() {
+    local level="$1"
+    local message="$2"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local line="[${timestamp}] [${level}]  ${message}"
+    echo "${line}" >> "${LOG_FILE:-/dev/null}"
+    echo "${line}" >&2
+}
+
 list_zpaq_files() {
     local zpaq_pattern="$1"
 
-    log "INFO" "list_zpaq_files: listing ${zpaq_pattern}"
+    _list_log "INFO" "list_zpaq_files: listing ${zpaq_pattern}"
 
     local raw_output
-    # Run zpaqfranz l; capture stderr separately so it doesn't pollute stdout.
+    # Run zpaqfranz l; all output goes to stdout in this build.
     # zpaqfranz exits non-zero on error; we check explicitly.
     local rc=0
     raw_output=$("${ZPAQFRANZ_BIN}" l "${zpaq_pattern}" 2>/dev/null) || rc=$?
 
     if (( rc != 0 )); then
-        log "ERROR" "list_zpaq_files: zpaqfranz l failed (rc=${rc}) for: ${zpaq_pattern}"
+        _list_log "ERROR" "list_zpaq_files: zpaqfranz l failed (rc=${rc}) for: ${zpaq_pattern}"
         return 1
     fi
 
@@ -137,13 +157,13 @@ list_zpaq_files() {
         }')
 
     if [[ -z "${file_list}" ]]; then
-        log "WARN" "list_zpaq_files: no stored files found in ${zpaq_pattern}"
+        _list_log "WARN" "list_zpaq_files: no stored files found in ${zpaq_pattern}"
         return 1
     fi
 
     local count
     count=$(printf '%s\n' "${file_list}" | wc -l | tr -d '[:space:]')
-    log "INFO" "list_zpaq_files: found ${count} file(s) in ${zpaq_pattern}"
+    _list_log "INFO" "list_zpaq_files: found ${count} file(s) in ${zpaq_pattern}"
 
     printf '%s\n' "${file_list}"
     return 0
