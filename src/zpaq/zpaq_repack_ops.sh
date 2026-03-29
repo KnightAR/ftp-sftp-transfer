@@ -278,10 +278,13 @@ extract_one_file() {
     mkdir -p "${_extract_dir_ref}"
 
     log "INFO" "extract_one_file: extracting '${internal_path}' (threads=${threads})"
+    log "DEBUG" "extract_one_file: zpaqfranz x ${zpaq_pattern} -only ${internal_path} -to ${_extract_dir_ref} -threads ${threads}"
 
     local rc=0
-    "${ZPAQFRANZ_BIN}" x "${zpaq_pattern}" "${internal_path}" \
-        "${_extract_dir_ref}" -threads "${threads}" \
+    "${ZPAQFRANZ_BIN}" x "${zpaq_pattern}" \
+        -only "${internal_path}" \
+        -to "${_extract_dir_ref}" \
+        -threads "${threads}" \
         | tee -a "${LOG_FILE:-/dev/null}"
     rc="${PIPESTATUS[0]}"
 
@@ -292,7 +295,9 @@ extract_one_file() {
         return 1
     fi
 
-    # Verify the expected output file exists
+    # Verify the expected output file exists.
+    # zpaqfranz x -to preserves internal subpaths, so the file lands at
+    # _extract_dir_ref/internal_path (subdirectories created automatically).
     local extracted_file="${_extract_dir_ref}/${internal_path}"
     if [[ ! -f "${extracted_file}" ]]; then
         log "ERROR" "extract_one_file: expected output not found: ${extracted_file}"
