@@ -9,8 +9,8 @@
 # Stage 1 — Extract worker:
 #   zpaqfranz x <pattern> <internal_path> <dir> -threads N
 #   Extracts to a tmpfs ramdisk (if headroom available) or disk fallback.
-#   First extraction uses THREADS_FIRST_EXTRACT (nproc-1); all subsequent
-#   extractions use THREADS_PIPELINE (floor((nproc-1)/2)).
+#   All extractions use THREADS_EXTRACT (nproc-1).
+#   Compression uses THREADS_COMPRESS (nproc-1).
 #
 # Stage 2 — Compress worker:
 #   pbzip2 -9 -c -p<N> -b<N> -m<N> <extracted_file>
@@ -45,8 +45,8 @@
 #   REPACK_OUTPUT_DIR       — local output directory for .bz2 files
 #   REPACK_REMOTE_DIR_RESOLVED — remote SFTP base directory
 #   REPACK_VERIFY_DIR       — ephemeral dir for re-download verification files
-#   THREADS_FIRST_EXTRACT   — thread count for first zpaqfranz extraction
-#   THREADS_PIPELINE        — thread count for subsequent extract + pbzip2
+#   THREADS_EXTRACT         — thread count for zpaqfranz extraction (nproc-1)
+#   THREADS_COMPRESS        — thread count for pbzip2 compression (nproc-1)
 #   PBZIP2_BLOCK            — pbzip2 -b value
 #   PBZIP2_MEMORY           — pbzip2 -m value
 #   LOG_FILE                — from setup_repack_logging()
@@ -65,7 +65,7 @@
 _REPACK_QUEUE_COUNTER=0
 
 # Tracks whether the first extraction has already run this session.
-_FIRST_EXTRACT_DONE=false
+
 
 # ============================================================
 # Logging helper for functions called inside $(...)
@@ -342,14 +342,11 @@ compress_one_file() {
     mkdir -p "$(dirname "${local_bz2_path}")"
     rm -f "${tmp_bz2}" "${tmp_sha}"
 
-    log "INFO" "compress_one_file: '${extracted_file}' → ${bz2_basename} (threads=${THREADS_PIPELINE})"
+    log "INFO" "compress_one_file: '${extracted_file}' → ${bz2_basename} (threads=${THREADS_COMPRESS})"
 
-    # Build pbzip2 -p flag: only pass it when an explicit thread count is set.
-    # THREADS_PIPELINE=0 means pbzip2 autodetects — but in practice
-    # THREADS_PIPELINE is always calculated from nproc, so it's always > 0.
     local pbzip2_threads_arg=()
-    if (( THREADS_PIPELINE > 0 )); then
-        pbzip2_threads_arg=( "-p${THREADS_PIPELINE}" )
+    if (( THREADS_COMPRESS > 0 )); then
+        pbzip2_threads_arg=( "-p${THREADS_COMPRESS}" )
     fi
 
     local rc_pbzip2 rc_tee
@@ -637,15 +634,7 @@ extract_worker() {
             continue
         fi
 
-        # Determine thread count: burst on first extraction, halved thereafter
-        local threads
-        if [[ "${_FIRST_EXTRACT_DONE}" == "false" ]]; then
-            threads="${THREADS_FIRST_EXTRACT}"
-            _FIRST_EXTRACT_DONE=true
-            log "INFO" "extract_worker: first extraction — using ${threads} threads (burst)"
-        else
-            threads="${THREADS_PIPELINE}"
-        fi
+        local threads="${THREADS_EXTRACT}"
 
         # Derive output paths
         local remote_subdir remote_name remote_dir
@@ -803,6 +792,9 @@ upload_worker() {
         if (( upload_rc == 0 )); then
             mv "${entry_file}" "${entry_file%.queued}.done"
             log "INFO" "upload_worker: done ${remote_name}"
+            # Remove local .bz2 and .sha256 after successful upload
+            rm -f "${local_bz2_path}" "${sha256_path}"
+            log "DEBUG" "upload_worker: removed local files for ${remote_name}"
         else
             mv "${entry_file}" "${entry_file%.queued}.failed"
             log "ERROR" "upload_worker: FAILED ${remote_name}"

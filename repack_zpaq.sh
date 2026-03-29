@@ -18,9 +18,9 @@
 #     Upload worker   — SFTP atomic put+verify+rename (I/O bound)
 #
 # Thread allocation:
-#   THREADS_FIRST_EXTRACT = nproc - 1   (burst, first extraction only)
-#   THREADS_PIPELINE      = floor((nproc-1)/2)  (steady state, shared)
-#   pbzip2 uses THREADS_PIPELINE via -p flag
+#   THREADS_EXTRACT = nproc - 1   (zpaqfranz extraction)
+#   THREADS_COMPRESS = nproc - 1  (pbzip2 compression)
+#   Both use nproc-1 since extract dominates runtime (~10-15min vs ~1min)
 #
 # Ramdisk:
 #   A tmpfs is mounted at ZPAQ_TEMP_DIR/ramdisk/ sized at MemAvailable/2.
@@ -121,8 +121,8 @@ COMPRESS_WORKER_PID=""
 UPLOAD_WORKER_PID=""
 
 # Thread counts (calculated in calc_threads)
-THREADS_FIRST_EXTRACT=1
-THREADS_PIPELINE=1
+THREADS_EXTRACT=1
+THREADS_COMPRESS=1
 
 # Resolved config values
 PBZIP2_BLOCK=""
@@ -310,13 +310,13 @@ calc_threads() {
     local nproc_val
     nproc_val=$(nproc 2>/dev/null || echo 1)
 
-    THREADS_FIRST_EXTRACT=$(( nproc_val - 1 ))
-    (( THREADS_FIRST_EXTRACT < 1 )) && THREADS_FIRST_EXTRACT=1
+    THREADS_EXTRACT=$(( nproc_val - 1 ))
+    (( THREADS_EXTRACT < 1 )) && THREADS_EXTRACT=1
 
-    THREADS_PIPELINE=$(( (nproc_val - 1) / 2 ))
-    (( THREADS_PIPELINE < 1 )) && THREADS_PIPELINE=1
+    THREADS_COMPRESS=$(( nproc_val - 1 ))
+    (( THREADS_COMPRESS < 1 )) && THREADS_COMPRESS=1
 
-    log "INFO" "calc_threads: nproc=${nproc_val} first_extract=${THREADS_FIRST_EXTRACT} pipeline=${THREADS_PIPELINE}"
+    log "INFO" "calc_threads: nproc=${nproc_val} extract=${THREADS_EXTRACT} compress=${THREADS_COMPRESS}"
 }
 
 # ============================================================
@@ -627,7 +627,7 @@ main() {
     detect_zpaqfranz
     calc_threads
 
-    log "INFO" "threads: first_extract=${THREADS_FIRST_EXTRACT} pipeline=${THREADS_PIPELINE}"
+    log "INFO" "threads: extract=${THREADS_EXTRACT} compress=${THREADS_COMPRESS}"
 
     # Export all globals needed by workers launched with &
     export ZPAQFRANZ_BIN
@@ -636,7 +636,7 @@ main() {
     export REPACK_OUTPUT_DIR REPACK_REMOTE_DIR_RESOLVED
     export RAMDISK_PATH RAMDISK_AVAILABLE RAMDISK_CAP_BYTES
     export REPACK_TEMP_DIR
-    export THREADS_FIRST_EXTRACT THREADS_PIPELINE
+    export THREADS_EXTRACT THREADS_COMPRESS
     export PBZIP2_BLOCK PBZIP2_MEMORY
     export LOG_FILE ERROR_LOG_FILE CLI_VERBOSE
     export ZPAQ_TEMP_DIR
