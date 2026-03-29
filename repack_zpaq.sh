@@ -349,6 +349,12 @@ setup_temp_dirs() {
         REPACK_TEMP_DIR="/tmp/repack_${USER:-$(id -un)}"
     fi
 
+    # Output dir for .bz2 files — default to under REPACK_TEMP_DIR if not
+    # explicitly set via config or -o CLI flag
+    if [[ "${REPACK_OUTPUT_DIR}" == "./repack_output" ]]; then
+        REPACK_OUTPUT_DIR="${REPACK_TEMP_DIR}/output"
+    fi
+
     # Ramdisk path (under temp dir)
     RAMDISK_PATH="${REPACK_TEMP_DIR}/ramdisk"
 
@@ -359,14 +365,16 @@ setup_temp_dirs() {
     mkdir -p "${REPACK_TEMP_DIR}"
     REPACK_VERIFY_DIR=$(mktemp -d "${REPACK_TEMP_DIR}/verify_$$.XXXXXX")
 
-    # Create queue subdirs
+    # Create queue subdirs and output dir
     mkdir -p \
         "${REPACK_QUEUE_DIR}/extract" \
         "${REPACK_QUEUE_DIR}/compress" \
         "${REPACK_QUEUE_DIR}/upload" \
-        "${REPACK_TEMP_DIR}/disk"
+        "${REPACK_TEMP_DIR}/disk" \
+        "${REPACK_OUTPUT_DIR}"
 
     log "INFO" "setup_temp_dirs: root=${REPACK_TEMP_DIR}"
+    log "INFO" "setup_temp_dirs: output=${REPACK_OUTPUT_DIR}"
     log "INFO" "setup_temp_dirs: queue=${REPACK_QUEUE_DIR}"
     log "DEBUG" "setup_temp_dirs: verify=${REPACK_VERIFY_DIR}"
 }
