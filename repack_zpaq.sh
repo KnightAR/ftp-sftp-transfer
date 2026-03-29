@@ -98,10 +98,10 @@ LOG_FILE=""
 ERROR_LOG_FILE=""
 
 # Temp directories (set up in setup_temp_dirs)
-REPACK_TEMP_DIR=""         # root temp dir for this run
-REPACK_QUEUE_DIR=""        # upload queue inbox
+REPACK_TEMP_DIR=""         # root temp dir (from ZPAQ_TEMP_DIR config or default)
+REPACK_QUEUE_DIR=""        # stable upload queue dir (persists across re-runs)
 REPACK_QUEUE_SENTINEL=""   # sentinel file path (signals queue is closed)
-REPACK_VERIFY_DIR=""       # re-download verification files
+REPACK_VERIFY_DIR=""       # ephemeral re-download verification files (mktemp)
 
 # Upload worker PID (set after background launch)
 UPLOAD_WORKER_PID=""
@@ -223,6 +223,10 @@ load_repack_config() {
     : "${REPACK_PBZIP2_BLOCK:=100}"
     : "${REPACK_PBZIP2_MEMORY:=2000}"
 
+    # Temp dir — same variable as storezpaq_multi.sh uses so operators have
+    # a single knob for all temp storage.  Defaults to /tmp if not set.
+    : "${ZPAQ_TEMP_DIR:=}"
+
     # Logging
     : "${LOG_DIR:=}"
     : "${LOG_RETENTION_DAYS:=30}"
@@ -322,15 +326,29 @@ setup_repack_logging() {
 
 # ============================================================
 # Temp directory setup
+#
+# Queue dir is stable and deterministic so re-runs can resume leftover
+# .queued items from a previous interrupted run.
+# Verify dir is ephemeral (mktemp) since it only holds transient
+# re-download files during upload verification.
 # ============================================================
 setup_temp_dirs() {
-    REPACK_TEMP_DIR=$(mktemp -d "/tmp/repack_$$.XXXXXX")
-    REPACK_QUEUE_DIR="${REPACK_TEMP_DIR}/upload_queue"
+    # Root temp dir: use ZPAQ_TEMP_DIR from config if set, else /tmp
+    if [[ -n "${ZPAQ_TEMP_DIR}" ]]; then
+        REPACK_TEMP_DIR="${ZPAQ_TEMP_DIR}/repack"
+    else
+        REPACK_TEMP_DIR="/tmp/repack_${USER:-$(id -un)}"
+    fi
+
+    # Stable queue dir: fixed path, persists across re-runs for resume
+    REPACK_QUEUE_DIR="${REPACK_TEMP_DIR}/queue"
     REPACK_QUEUE_SENTINEL="${REPACK_QUEUE_DIR}/DONE_SENTINEL"
-    REPACK_VERIFY_DIR="${REPACK_TEMP_DIR}/verify"
+
+    # Ephemeral verify dir: unique per run (holds transient download files)
+    REPACK_VERIFY_DIR=$(mktemp -d "${REPACK_TEMP_DIR}/verify_$$.XXXXXX")
 
     mkdir -p "${REPACK_QUEUE_DIR}" "${REPACK_VERIFY_DIR}"
-    log "DEBUG" "setup_temp_dirs: ${REPACK_TEMP_DIR}"
+    log "INFO" "setup_temp_dirs: queue=${REPACK_QUEUE_DIR} verify=${REPACK_VERIFY_DIR}"
 }
 
 # ============================================================
@@ -376,10 +394,11 @@ trap_cleanup() {
         kill "${UPLOAD_WORKER_PID}" 2>/dev/null || true
     fi
 
-    # Remove temp directory
-    if [[ -n "${REPACK_TEMP_DIR}" && -d "${REPACK_TEMP_DIR}" ]]; then
-        rm -rf "${REPACK_TEMP_DIR}"
-        log "DEBUG" "trap_cleanup: removed ${REPACK_TEMP_DIR}"
+    # Remove only the ephemeral verify dir — the queue dir is intentionally
+    # kept so that a re-run can resume any leftover .queued items.
+    if [[ -n "${REPACK_VERIFY_DIR}" && -d "${REPACK_VERIFY_DIR}" ]]; then
+        rm -rf "${REPACK_VERIFY_DIR}"
+        log "DEBUG" "trap_cleanup: removed verify dir ${REPACK_VERIFY_DIR}"
     fi
 
     release_repack_lock
@@ -548,6 +567,42 @@ main() {
     export REPACK_QUEUE_DIR REPACK_QUEUE_SENTINEL REPACK_VERIFY_DIR
     export PBZIP2_BLOCK PBZIP2_MEMORY PBZIP2_THREADS
     export LOG_FILE ERROR_LOG_FILE CLI_VERBOSE
+    export ZPAQ_TEMP_DIR
+
+    # ------------------------------------------------------------------
+    # Queue housekeeping: clean up sentinel from any prior run, seed the
+    # monotonic counter from any leftover items, and report resumed items.
+    # ------------------------------------------------------------------
+    if [[ "${CLI_DRY_RUN}" == false ]]; then
+        # Remove sentinel from previous run so the worker doesn't exit early
+        rm -f "${REPACK_QUEUE_SENTINEL}"
+
+        # Seed counter from highest existing item number to avoid collisions
+        # with leftover .queued / .done / .failed files from a prior run.
+        local highest=0
+        local qf qnum
+        while IFS= read -r -d $'\0' qf; do
+            qnum=$(basename "${qf}")
+            qnum="${qnum%%.*}"          # strip extension, keep numeric prefix
+            qnum="${qnum##*[^0-9]}"     # strip any non-numeric prefix (safety)
+            if [[ "${qnum}" =~ ^[0-9]+$ ]] && (( qnum > highest )); then
+                highest="${qnum}"
+            fi
+        done < <(find "${REPACK_QUEUE_DIR}" -maxdepth 1 \
+                    \( -name "*.queued" -o -name "*.done" -o -name "*.failed" \) \
+                    -print0 2>/dev/null)
+        _REPACK_QUEUE_COUNTER="${highest}"
+        log "DEBUG" "Queue counter seeded to ${_REPACK_QUEUE_COUNTER}"
+
+        # Count and log any leftover .queued items from a prior interrupted run
+        local resumed=0
+        while IFS= read -r -d $'\0' qf; do
+            (( resumed++ )) || true
+        done < <(find "${REPACK_QUEUE_DIR}" -maxdepth 1 -name "*.queued" -print0 2>/dev/null)
+        if (( resumed > 0 )); then
+            log "INFO" "Resuming ${resumed} leftover queued upload(s) from previous run"
+        fi
+    fi
 
     # ------------------------------------------------------------------
     # Launch upload worker in the background
@@ -596,6 +651,19 @@ main() {
         log "INFO" "Waiting for upload worker to finish (PID=${UPLOAD_WORKER_PID})..."
         wait "${UPLOAD_WORKER_PID}" || true
         log "INFO" "Upload worker exited"
+
+        # Clean up .done entries — they've been successfully uploaded and are
+        # no longer needed. .failed entries are left for operator inspection
+        # and will be re-picked-up on the next run.
+        local done_count=0
+        local df
+        while IFS= read -r -d $'\0' df; do
+            rm -f "${df}"
+            (( done_count++ )) || true
+        done < <(find "${REPACK_QUEUE_DIR}" -maxdepth 1 -name "*.done" -print0 2>/dev/null)
+        if (( done_count > 0 )); then
+            log "DEBUG" "Cleaned up ${done_count} completed queue entry/entries"
+        fi
     fi
 
     # ------------------------------------------------------------------
