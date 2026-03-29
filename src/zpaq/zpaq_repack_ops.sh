@@ -278,12 +278,12 @@ extract_one_file() {
     mkdir -p "${_extract_dir_ref}"
 
     log "INFO" "extract_one_file: extracting '${internal_path}' (threads=${threads})"
-    log "DEBUG" "extract_one_file: zpaqfranz x ${zpaq_pattern} -only ${internal_path} -to ${_extract_dir_ref} -threads ${threads}"
+    log "DEBUG" "extract_one_file: zpaqfranz x ${zpaq_pattern} -only ${internal_path} -to ${_extract_dir_ref}/ -threads ${threads}"
 
     local rc=0
     "${ZPAQFRANZ_BIN}" x "${zpaq_pattern}" \
         -only "${internal_path}" \
-        -to "${_extract_dir_ref}" \
+        -to "${_extract_dir_ref}/" \
         -threads "${threads}" \
         | tee -a "${LOG_FILE:-/dev/null}"
     rc="${PIPESTATUS[0]}"
