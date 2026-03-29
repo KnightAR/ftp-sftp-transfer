@@ -2,73 +2,54 @@
 # ============================================================
 # src/zpaq/zpaq_repack_ops.sh — zpaq Repack Operations
 #
-# Implements the extract → compress → upload pipeline used by
-# repack_zpaq.sh to recompress files stored inside .zpaq archives
-# to .bz2 format and upload them to an SFTP server.
+# Implements a three-stage extract → compress → upload pipeline used by
+# repack_zpaq.sh to recompress files stored inside .zpaq archives to
+# .bz2 format and upload them to an SFTP server.
 #
-# Public functions:
+# Stage 1 — Extract worker:
+#   zpaqfranz x <pattern> <internal_path> <dir> -threads N
+#   Extracts to a tmpfs ramdisk (if headroom available) or disk fallback.
+#   First extraction uses THREADS_FIRST_EXTRACT (nproc-1); all subsequent
+#   extractions use THREADS_PIPELINE (floor((nproc-1)/2)).
 #
-#   list_zpaq_files ZPAQ_PATTERN
-#       Runs "zpaqfranz l <pattern>" and prints one internal file
-#       path per line (only "+" stored entries; deleted "-" entries
-#       and header/summary lines are excluded).
-#       Output goes to stdout. Returns 0 on success, 1 on error.
+# Stage 2 — Compress worker:
+#   pbzip2 -9 -c -p<N> -b<N> -m<N> <extracted_file>
+#       | tee >(sha256sum > .sha256.tmp)
+#       > .bz2.tmp
+#   Reads from the extracted file on ramdisk/disk. On completion the
+#   extract dir is removed immediately (freeing RAM or disk space).
 #
-#   remote_file_exists REMOTE_DIR REMOTE_NAME
-#       Probes the SFTP server for <REMOTE_DIR>/<REMOTE_NAME>.
-#       Returns 0 if the file is present, 1 if absent or on error.
-#       Uses _zpaq_sftp_run from zpaq_sftp_ops.sh.
+# Stage 3 — Upload worker:
+#   Atomic SFTP: put to .tmp_upload → re-download → sha256 verify → rename.
 #
-#   ensure_remote_dir REMOTE_DIR
-#       Attempts "mkdir <REMOTE_DIR>" on the SFTP server.
-#       Ignores errors (directory may already exist).
+# Queue layout (all under REPACK_QUEUE_DIR):
+#   extract/<N>.pending   — main loop → extract worker
+#   compress/<N>.pending  — extract worker → compress worker
+#   upload/<N>.queued     — compress worker → upload worker
+#   upload/<N>.done       — upload worker success
+#   upload/<N>.failed     — upload worker failure
 #
-#   compress_one_file ZPAQ_PATTERN INTERNAL_PATH LOCAL_BZ2_PATH
-#       Runs:
-#         zpaqfranz x <pattern> <internal_path> -stdout
-#             | pbzip2 -9 -c -b<N> -m<N>
-#             | tee >(sha256sum > <local_bz2_path>.sha256.tmp)
-#             > <local_bz2_path>.tmp
-#       Checks all PIPESTATUS values.
-#       On success: renames .tmp → final; fixes sha256 file (replaces
-#       "-" placeholder with the actual filename).
-#       On failure: removes .tmp files and returns 1.
-#       Returns 0 on success, 1 on error.
+# Each worker propagates a DONE_SENTINEL to its downstream queue when
+# it has drained its input queue and seen the upstream sentinel:
+#   extract/DONE_SENTINEL  — written by main loop
+#   compress/DONE_SENTINEL — written by extract worker on exit
+#   upload/DONE_SENTINEL   — written by compress worker on exit
 #
-#   enqueue_item LOCAL_BZ2_PATH SHA256_PATH REMOTE_DIR REMOTE_NAME
-#       Writes a queue entry file into REPACK_QUEUE_DIR with a
-#       monotonic counter prefix to preserve ordering.
-#       Returns 0 always.
-#
-#   dequeue_next_item
-#       Finds the oldest (lowest-numbered) .queued file in
-#       REPACK_QUEUE_DIR. Prints its path to stdout.
-#       Prints nothing and returns 1 if the queue is empty.
-#
-#   upload_one_file LOCAL_BZ2_PATH SHA256_PATH REMOTE_DIR REMOTE_NAME
-#       Atomic SFTP upload:
-#         1. put <local_bz2_path> → <remote_dir>/<remote_name>.tmp_upload
-#         2. get <remote_dir>/<remote_name>.tmp_upload → <verify_tmp>
-#         3. sha256sum <verify_tmp> vs contents of SHA256_PATH
-#         4. rename .tmp_upload → <remote_dir>/<remote_name>
-#       Returns 0 on success, 1 on any failure.
-#
-#   upload_worker
-#       Background polling loop. Reads queue entry files, calls
-#       upload_one_file for each, marks items .done or .failed.
-#       Exits when REPACK_QUEUE_SENTINEL file exists and queue is empty.
-#       Intended to be launched with: upload_worker & UPLOAD_WORKER_PID=$!
-#
-# Required globals (set by repack_zpaq.sh before sourcing):
-#   ZPAQFRANZ_BIN       — from zpaq_utils.sh / detect_zpaqfranz()
+# Required globals (set by repack_zpaq.sh):
+#   ZPAQFRANZ_BIN           — from detect_zpaqfranz()
 #   SFTP_HOST, SFTP_PORT, SFTP_USER, SFTP_PASS
-#                       — from load_repack_config()
-#   REPACK_QUEUE_DIR    — temp dir for queue entry files
-#   REPACK_QUEUE_SENTINEL — path to sentinel file (signals queue done)
-#   REPACK_VERIFY_DIR   — temp dir for re-download verification files
-#   PBZIP2_BLOCK        — pbzip2 -b value (default 100)
-#   PBZIP2_MEMORY       — pbzip2 -m value (default 2000)
-#   LOG_FILE            — from setup_repack_logging()
+#   REPACK_QUEUE_DIR        — root queue directory
+#   RAMDISK_PATH            — tmpfs mount point
+#   RAMDISK_AVAILABLE       — "true" if tmpfs mounted successfully
+#   RAMDISK_CAP_BYTES       — tmpfs size cap in bytes (MemAvailable/2 at mount time)
+#   REPACK_OUTPUT_DIR       — local output directory for .bz2 files
+#   REPACK_REMOTE_DIR_RESOLVED — remote SFTP base directory
+#   REPACK_VERIFY_DIR       — ephemeral dir for re-download verification files
+#   THREADS_FIRST_EXTRACT   — thread count for first zpaqfranz extraction
+#   THREADS_PIPELINE        — thread count for subsequent extract + pbzip2
+#   PBZIP2_BLOCK            — pbzip2 -b value
+#   PBZIP2_MEMORY           — pbzip2 -m value
+#   LOG_FILE                — from setup_repack_logging()
 #
 # Dependency order:
 #   Must be sourced after:
@@ -78,41 +59,22 @@
 # ============================================================
 
 # ---------------------------------------------------------------------------
-# Internal: monotonic counter for queue file ordering.
-# Each call to enqueue_item() increments this.
+# Monotonic counter for queue file ordering — seeded from existing queue
+# items by repack_zpaq.sh main() on startup.
 # ---------------------------------------------------------------------------
 _REPACK_QUEUE_COUNTER=0
 
-# ---------------------------------------------------------------------------
-# list_zpaq_files ZPAQ_PATTERN
-#
-# Runs "zpaqfranz l <ZPAQ_PATTERN>" and prints the internal path of every
-# stored ("+") file to stdout, one per line.
-#
-# The listing format produced by zpaqfranz l is:
-#
-#   YYYY-MM-DD HH:MM:SS     <size_with_dots>   <ratio>% + <internal/path>
-#
-# Size uses European thousand separators (dots), which we ignore entirely.
-# Only lines containing " + " after a date field are processed.
-# Lines beginning with the header, separator, or summary are skipped.
-#
-# Multipart archives: ZPAQ_PATTERN may contain "???????" wildcards and is
-# passed directly to zpaqfranz, which handles multipart internally.
-#
-# IMPORTANT: This function is called inside $(...) by the main loop, so
-# stdout is captured by the caller. Per the logging.sh convention for
-# functions called inside $(), log() must NOT be used here — it writes
-# to stdout which would be captured into the variable. Instead, progress
-# is written directly to ${LOG_FILE} and echoed to stderr.
-#
-# Returns 0 on success, 1 if zpaqfranz fails or produces no output.
-# ---------------------------------------------------------------------------
+# Tracks whether the first extraction has already run this session.
+_FIRST_EXTRACT_DONE=false
 
-# _list_log LEVEL MESSAGE
-# Internal helper for list_zpaq_files(): writes directly to LOG_FILE +
-# stderr instead of stdout, safe for use inside $(...) subshells.
-_list_log() {
+# ============================================================
+# Logging helper for functions called inside $(...)
+# ============================================================
+
+# _subshell_log LEVEL MESSAGE
+# Writes directly to LOG_FILE + stderr. Safe inside $(...) subshells where
+# log() must not be used (log() writes to stdout, polluting captured output).
+_subshell_log() {
     local level="$1"
     local message="$2"
     local timestamp
@@ -122,62 +84,324 @@ _list_log() {
     echo "${line}" >&2
 }
 
+# ============================================================
+# list_zpaq_files ZPAQ_PATTERN
+# ============================================================
+# Runs "zpaqfranz l <ZPAQ_PATTERN>" and prints one line per stored file:
+#   <uncompressed_bytes>\t<internal/path>
+#
+# The size field uses European dot thousand-separators (e.g. 6.405.382.298)
+# which are stripped before output. Only "+" (stored) entries are included;
+# "-" (deleted) entries and header/summary lines are excluded.
+#
+# Multipart archives: ZPAQ_PATTERN may contain "???????" wildcards and is
+# passed directly to zpaqfranz, which handles multipart internally.
+#
+# IMPORTANT: Called inside $(...) — uses _subshell_log() not log().
+# Returns 0 on success, 1 on error or empty listing.
+# ============================================================
 list_zpaq_files() {
     local zpaq_pattern="$1"
 
-    _list_log "INFO" "list_zpaq_files: listing ${zpaq_pattern}"
+    _subshell_log "INFO" "list_zpaq_files: listing ${zpaq_pattern}"
 
-    local raw_output
-    # Run zpaqfranz l; all output goes to stdout in this build.
-    # zpaqfranz exits non-zero on error; we check explicitly.
-    local rc=0
+    local raw_output rc=0
     raw_output=$("${ZPAQFRANZ_BIN}" l "${zpaq_pattern}" 2>/dev/null) || rc=$?
 
     if (( rc != 0 )); then
-        _list_log "ERROR" "list_zpaq_files: zpaqfranz l failed (rc=${rc}) for: ${zpaq_pattern}"
+        _subshell_log "ERROR" "list_zpaq_files: zpaqfranz l failed (rc=${rc}) for: ${zpaq_pattern}"
         return 1
     fi
 
-    # Parse: find data lines containing a date field and a " + " marker.
-    # The date may be preceded by optional leading spaces (format varies by build).
-    # awk finds the " + " marker and prints everything after it.
-    # Trims any trailing carriage returns (Windows-style CRLF from some builds).
+    # Parse data lines: date field present + " + " marker present.
+    # Field layout (after leading optional whitespace):
+    #   $1=date  $2=time  $3=size(dots)  $4=ratio%  $5="+"  $6...=path
+    # We use index() to find " + " and extract everything after it as the
+    # path, avoiding any whitespace splitting issues in the path itself.
+    # Size is field $3 with dots stripped.
     local file_list
     file_list=$(printf '%s\n' "${raw_output}" \
         | awk '/[0-9]{4}-[0-9]{2}-[0-9]{2}/ && / \+ / {
             idx = index($0, " + ")
             if (idx > 0) {
                 path = substr($0, idx + 3)
-                # trim trailing CR if present
                 sub(/\r$/, "", path)
-                # trim trailing whitespace
                 sub(/[[:space:]]+$/, "", path)
-                if (path != "") print path
+                if (path == "") next
+                # Extract size field (3rd whitespace-delimited token)
+                # and strip European dot thousand-separators
+                size = $3
+                gsub(/\./, "", size)
+                if (size !~ /^[0-9]+$/) size = "0"
+                print size "\t" path
             }
         }')
 
     if [[ -z "${file_list}" ]]; then
-        _list_log "WARN" "list_zpaq_files: no stored files found in ${zpaq_pattern}"
+        _subshell_log "WARN" "list_zpaq_files: no stored files found in ${zpaq_pattern}"
         return 1
     fi
 
     local count
     count=$(printf '%s\n' "${file_list}" | wc -l | tr -d '[:space:]')
-    _list_log "INFO" "list_zpaq_files: found ${count} file(s) in ${zpaq_pattern}"
+    _subshell_log "INFO" "list_zpaq_files: found ${count} file(s) in ${zpaq_pattern}"
 
     printf '%s\n' "${file_list}"
     return 0
 }
 
-# ---------------------------------------------------------------------------
+# ============================================================
+# Ramdisk management
+# ============================================================
+
+# ramdisk_mount
+# Reads MemAvailable from /proc/meminfo, halves it, and mounts a tmpfs at
+# RAMDISK_PATH with that size cap. Sets RAMDISK_AVAILABLE=true on success.
+# Falls back gracefully on failure (RAMDISK_AVAILABLE=false).
+ramdisk_mount() {
+    local mem_avail_kb
+    mem_avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+
+    if (( mem_avail_kb == 0 )); then
+        log "WARN" "ramdisk_mount: cannot read MemAvailable — falling back to disk"
+        RAMDISK_AVAILABLE="false"
+        return 0
+    fi
+
+    # Half of available RAM in bytes
+    local cap_bytes=$(( mem_avail_kb * 1024 / 2 ))
+    RAMDISK_CAP_BYTES="${cap_bytes}"
+
+    local cap_human
+    cap_human=$(awk -v b="${cap_bytes}" 'BEGIN { printf "%.1f GiB", b/1073741824 }')
+
+    mkdir -p "${RAMDISK_PATH}"
+    log "INFO" "ramdisk_mount: mounting tmpfs at ${RAMDISK_PATH} (cap=${cap_human})"
+
+    local rc=0
+    sudo mount -t tmpfs -o "size=${cap_bytes}" tmpfs "${RAMDISK_PATH}" || rc=$?
+
+    if (( rc != 0 )); then
+        log "WARN" "ramdisk_mount: sudo mount failed (rc=${rc}) — falling back to disk for all extractions"
+        RAMDISK_AVAILABLE="false"
+        rmdir "${RAMDISK_PATH}" 2>/dev/null || true
+        return 0
+    fi
+
+    RAMDISK_AVAILABLE="true"
+    log "INFO" "ramdisk_mount: mounted OK (cap=${cap_human}, RAMDISK_AVAILABLE=true)"
+    return 0
+}
+
+# ramdisk_umount
+# Unmounts the tmpfs ramdisk. Called from trap_cleanup in repack_zpaq.sh.
+ramdisk_umount() {
+    if [[ "${RAMDISK_AVAILABLE:-false}" != "true" ]]; then
+        return 0
+    fi
+    if ! mountpoint -q "${RAMDISK_PATH}" 2>/dev/null; then
+        return 0
+    fi
+    log "INFO" "ramdisk_umount: unmounting ${RAMDISK_PATH}"
+    sudo umount "${RAMDISK_PATH}" 2>/dev/null || \
+        log "WARN" "ramdisk_umount: umount returned non-zero (may already be unmounted)"
+    rmdir "${RAMDISK_PATH}" 2>/dev/null || true
+}
+
+# ramdisk_headroom
+# Prints the number of free bytes remaining under the ramdisk cap.
+# Uses du to measure actual current usage.
+# Prints 0 if RAMDISK_AVAILABLE=false.
+ramdisk_headroom() {
+    if [[ "${RAMDISK_AVAILABLE:-false}" != "true" ]]; then
+        echo 0
+        return 0
+    fi
+    local used_bytes
+    used_bytes=$(du -sb "${RAMDISK_PATH}" 2>/dev/null | awk '{print $1}')
+    used_bytes="${used_bytes:-0}"
+    local headroom=$(( RAMDISK_CAP_BYTES - used_bytes ))
+    (( headroom < 0 )) && headroom=0
+    echo "${headroom}"
+}
+
+# ============================================================
+# extract_one_file ZPAQ_PATTERN INTERNAL_PATH UNCOMPRESSED_SIZE
+#                 EXTRACT_DIR_VAR THREADS
+# ============================================================
+# Extracts INTERNAL_PATH from ZPAQ_PATTERN into a subdirectory, choosing
+# ramdisk or disk based on available headroom.
+#
+# Sets the caller's EXTRACT_DIR_VAR nameref to the chosen extraction root
+# directory (the parent that zpaqfranz writes into, preserving subpaths).
+# The extracted file will be at: <extract_dir>/<internal_path>
+#
+# Returns 0 on success, 1 on error.
+# ============================================================
+extract_one_file() {
+    local zpaq_pattern="$1"
+    local internal_path="$2"
+    local uncompressed_size="$3"
+    local -n _extract_dir_ref="$4"
+    local threads="$5"
+
+    # Size with 10% padding
+    local needed_bytes
+    needed_bytes=$(awk -v s="${uncompressed_size}" 'BEGIN { printf "%d", int(s * 1.10) }')
+
+    # Decide: ramdisk or disk?
+    local use_ramdisk=false
+    if [[ "${RAMDISK_AVAILABLE:-false}" == "true" ]]; then
+        local headroom
+        headroom=$(ramdisk_headroom)
+        if (( needed_bytes > 0 && needed_bytes <= headroom )); then
+            use_ramdisk=true
+        else
+            local headroom_gib
+            headroom_gib=$(awk -v b="${headroom}" 'BEGIN { printf "%.1f", b/1073741824 }')
+            local needed_gib
+            needed_gib=$(awk -v b="${needed_bytes}" 'BEGIN { printf "%.1f", b/1073741824 }')
+            log "DEBUG" "extract_one_file: ramdisk headroom ${headroom_gib} GiB < needed ${needed_gib} GiB — using disk"
+        fi
+    fi
+
+    # Allocate extraction directory
+    local counter_str
+    counter_str=$(printf '%08d' "${_REPACK_QUEUE_COUNTER}")
+    if [[ "${use_ramdisk}" == true ]]; then
+        _extract_dir_ref="${RAMDISK_PATH}/${counter_str}"
+        log "DEBUG" "extract_one_file: using ramdisk → ${_extract_dir_ref}"
+    else
+        _extract_dir_ref="${REPACK_TEMP_DIR}/disk/${counter_str}"
+        log "DEBUG" "extract_one_file: using disk → ${_extract_dir_ref}"
+    fi
+    mkdir -p "${_extract_dir_ref}"
+
+    log "INFO" "extract_one_file: extracting '${internal_path}' (threads=${threads})"
+
+    local rc=0
+    "${ZPAQFRANZ_BIN}" x "${zpaq_pattern}" "${internal_path}" \
+        "${_extract_dir_ref}" -threads "${threads}" \
+        | tee -a "${LOG_FILE:-/dev/null}"
+    rc="${PIPESTATUS[0]}"
+
+    if (( rc != 0 )); then
+        log "ERROR" "extract_one_file: zpaqfranz x failed (rc=${rc}) for '${internal_path}'"
+        rm -rf "${_extract_dir_ref}"
+        _extract_dir_ref=""
+        return 1
+    fi
+
+    # Verify the expected output file exists
+    local extracted_file="${_extract_dir_ref}/${internal_path}"
+    if [[ ! -f "${extracted_file}" ]]; then
+        log "ERROR" "extract_one_file: expected output not found: ${extracted_file}"
+        rm -rf "${_extract_dir_ref}"
+        _extract_dir_ref=""
+        return 1
+    fi
+
+    log "INFO" "extract_one_file: OK '${internal_path}' → ${_extract_dir_ref}"
+    return 0
+}
+
+# ============================================================
+# compress_one_file EXTRACTED_FILE LOCAL_BZ2_PATH
+# ============================================================
+# Compresses EXTRACTED_FILE to LOCAL_BZ2_PATH using pbzip2, simultaneously
+# hashing the .bz2 stream via tee+sha256sum for upload verification.
+#
+# Pipeline:
+#   pbzip2 -9 -c -p<N> -b<N> -m<N> <extracted_file>
+#       | tee >(sha256sum > <local_bz2_path>.sha256.tmp)
+#       > <local_bz2_path>.tmp
+#
+# On success:
+#   - Moves .bz2.tmp → final .bz2
+#   - Fixes .sha256.tmp: replaces "-" with actual filename → .sha256
+# On failure:
+#   - Removes .tmp files; returns 1
+#
+# Returns 0 on success, 1 on error.
+# ============================================================
+compress_one_file() {
+    local extracted_file="$1"
+    local local_bz2_path="$2"
+
+    local tmp_bz2="${local_bz2_path}.tmp"
+    local tmp_sha="${local_bz2_path}.sha256.tmp"
+    local final_sha="${local_bz2_path}.sha256"
+    local bz2_basename
+    bz2_basename=$(basename "${local_bz2_path}")
+
+    mkdir -p "$(dirname "${local_bz2_path}")"
+    rm -f "${tmp_bz2}" "${tmp_sha}"
+
+    log "INFO" "compress_one_file: '${extracted_file}' → ${bz2_basename} (threads=${THREADS_PIPELINE})"
+
+    # Build pbzip2 -p flag: only pass it when an explicit thread count is set.
+    # THREADS_PIPELINE=0 means pbzip2 autodetects — but in practice
+    # THREADS_PIPELINE is always calculated from nproc, so it's always > 0.
+    local pbzip2_threads_arg=()
+    if (( THREADS_PIPELINE > 0 )); then
+        pbzip2_threads_arg=( "-p${THREADS_PIPELINE}" )
+    fi
+
+    local rc_pbzip2 rc_tee
+    set +e
+    pbzip2 -9 -c \
+        "${pbzip2_threads_arg[@]}" \
+        -b"${PBZIP2_BLOCK:-100}" \
+        -m"${PBZIP2_MEMORY:-2000}" \
+        "${extracted_file}" \
+        | tee >(sha256sum > "${tmp_sha}") \
+        > "${tmp_bz2}"
+    rc_pbzip2="${PIPESTATUS[0]}"
+    rc_tee="${PIPESTATUS[1]}"
+    set -e
+
+    if (( rc_pbzip2 != 0 || rc_tee != 0 )); then
+        log "ERROR" "compress_one_file: pipeline failed (rc_pbzip2=${rc_pbzip2} rc_tee=${rc_tee}) for ${bz2_basename}"
+        rm -f "${tmp_bz2}" "${tmp_sha}"
+        return 1
+    fi
+
+    if [[ ! -s "${tmp_bz2}" ]]; then
+        log "ERROR" "compress_one_file: output .bz2 is empty: ${tmp_bz2}"
+        rm -f "${tmp_bz2}" "${tmp_sha}"
+        return 1
+    fi
+
+    if [[ ! -f "${tmp_sha}" ]]; then
+        log "ERROR" "compress_one_file: sha256 tmp missing: ${tmp_sha}"
+        rm -f "${tmp_bz2}"
+        return 1
+    fi
+
+    local hash_value
+    hash_value=$(awk '{print $1}' "${tmp_sha}")
+    if [[ -z "${hash_value}" ]]; then
+        log "ERROR" "compress_one_file: sha256sum produced empty output for ${bz2_basename}"
+        rm -f "${tmp_bz2}" "${tmp_sha}"
+        return 1
+    fi
+
+    printf '%s  %s\n' "${hash_value}" "${bz2_basename}" > "${final_sha}"
+    rm -f "${tmp_sha}"
+    mv "${tmp_bz2}" "${local_bz2_path}"
+
+    local bz2_size
+    bz2_size=$(stat -c "%s" "${local_bz2_path}" 2>/dev/null || echo "?")
+    log "INFO" "compress_one_file: OK ${bz2_basename} (${bz2_size} bytes, sha256=${hash_value})"
+    return 0
+}
+
+# ============================================================
+# SFTP helpers (remote_file_exists, ensure_remote_dir, upload_one_file)
+# ============================================================
+
 # remote_file_exists REMOTE_DIR REMOTE_NAME
-#
-# Probes the SFTP server for the presence of REMOTE_DIR/REMOTE_NAME.
-# Uses "ls -1 <remote_dir>" batch command and greps the output for the
-# exact filename — same approach as zpaq_sftp_prune_backups().
-#
-# Returns 0 if the file exists, 1 if absent or if the ls command fails.
-# ---------------------------------------------------------------------------
+# Returns 0 if REMOTE_DIR/REMOTE_NAME exists on SFTP server, 1 if absent.
 remote_file_exists() {
     local remote_dir="$1"
     local remote_name="$2"
@@ -194,249 +418,31 @@ remote_file_exists() {
                 2>/dev/null) || rc=$?
 
     if (( rc != 0 )); then
-        log "DEBUG" "remote_file_exists: ls failed (rc=${rc}) for ${remote_dir} — treating as absent"
+        log "DEBUG" "remote_file_exists: ls failed (rc=${rc}) — treating as absent"
         return 1
     fi
 
     if printf '%s\n' "${listing}" | grep -qF "${remote_name}"; then
-        log "DEBUG" "remote_file_exists: ${remote_name} found in ${remote_dir}"
+        log "DEBUG" "remote_file_exists: found ${remote_name}"
         return 0
     fi
 
-    log "DEBUG" "remote_file_exists: ${remote_name} not found in ${remote_dir}"
+    log "DEBUG" "remote_file_exists: not found ${remote_name}"
     return 1
 }
 
-# ---------------------------------------------------------------------------
 # ensure_remote_dir REMOTE_DIR
-#
-# Creates REMOTE_DIR on the SFTP server if it does not already exist.
-# "mkdir" errors are silently ignored — the directory likely already exists.
-# Returns 0 always.
-# ---------------------------------------------------------------------------
+# Creates REMOTE_DIR on SFTP; ignores errors (may already exist).
 ensure_remote_dir() {
     local remote_dir="$1"
-
     log "DEBUG" "ensure_remote_dir: mkdir ${remote_dir}"
-
-    # sftp returns non-zero if mkdir fails (e.g. already exists) — ignore.
     _zpaq_sftp_run "mkdir ${remote_dir}" 2>/dev/null || true
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# compress_one_file ZPAQ_PATTERN INTERNAL_PATH LOCAL_BZ2_PATH
-#
-# Extracts INTERNAL_PATH from ZPAQ_PATTERN via "zpaqfranz x ... -stdout",
-# pipes through pbzip2 (parallel bzip2 at level -9 with configured block/
-# memory limits), and simultaneously hashes the bz2 stream via tee+sha256sum.
-#
-# Pipeline:
-#   zpaqfranz x <pattern> <internal_path> -stdout
-#       | pbzip2 -9 -c -b<PBZIP2_BLOCK> -m<PBZIP2_MEMORY>
-#       | tee >(sha256sum > <local_bz2_path>.sha256.tmp)
-#       > <local_bz2_path>.tmp
-#
-# The sha256 is of the compressed .bz2 bytes (upload/transfer integrity).
-#
-# On success:
-#   - Moves <local_bz2_path>.tmp  → <local_bz2_path>
-#   - Fixes <local_bz2_path>.sha256.tmp: replaces the "-" stdin placeholder
-#     with the actual filename, writes to <local_bz2_path>.sha256
-#   - Removes the .sha256.tmp file
-#
-# On failure:
-#   - Removes both .tmp files
-#   - Returns 1
-#
-# Globals used: ZPAQFRANZ_BIN, PBZIP2_BLOCK, PBZIP2_MEMORY, LOG_FILE
-# Returns 0 on success, 1 on error.
-# ---------------------------------------------------------------------------
-compress_one_file() {
-    local zpaq_pattern="$1"
-    local internal_path="$2"
-    local local_bz2_path="$3"
-
-    local tmp_bz2="${local_bz2_path}.tmp"
-    local tmp_sha="${local_bz2_path}.sha256.tmp"
-    local final_sha="${local_bz2_path}.sha256"
-    local bz2_basename
-    bz2_basename=$(basename "${local_bz2_path}")
-
-    # Ensure output directory exists
-    mkdir -p "$(dirname "${local_bz2_path}")"
-
-    log "INFO" "compress_one_file: extracting '${internal_path}' from ${zpaq_pattern}"
-    log "INFO" "compress_one_file: output → ${local_bz2_path}"
-
-    # Remove any stale temp files from a previous interrupted run
-    rm -f "${tmp_bz2}" "${tmp_sha}"
-
-    # Run the three-stage pipeline.
-    # tee uses process substitution (requires bash, already guaranteed by
-    # the #!/usr/bin/env bash shebang and set -euo pipefail in the caller).
-    # We must disable set -e around this block to capture PIPESTATUS reliably —
-    # set -e would exit on the first non-zero before we can inspect PIPESTATUS.
-    local rc_zpaq rc_pbzip2 rc_tee
-    set +e
-    "${ZPAQFRANZ_BIN}" x "${zpaq_pattern}" "${internal_path}" -stdout 2>/dev/null \
-        | pbzip2 -9 -c -b"${PBZIP2_BLOCK:-100}" -m"${PBZIP2_MEMORY:-2000}" \
-        | tee >(sha256sum > "${tmp_sha}") \
-        > "${tmp_bz2}"
-    rc_zpaq="${PIPESTATUS[0]}"
-    rc_pbzip2="${PIPESTATUS[1]}"
-    rc_tee="${PIPESTATUS[2]}"
-    set -e
-
-    # Check all three stages
-    if (( rc_zpaq != 0 || rc_pbzip2 != 0 || rc_tee != 0 )); then
-        log "ERROR" "compress_one_file: pipeline failed for '${internal_path}'"
-        log "ERROR" "  rc_zpaqfranz=${rc_zpaq} rc_pbzip2=${rc_pbzip2} rc_tee=${rc_tee}"
-        rm -f "${tmp_bz2}" "${tmp_sha}"
-        return 1
-    fi
-
-    # Verify output files exist and are non-empty
-    if [[ ! -s "${tmp_bz2}" ]]; then
-        log "ERROR" "compress_one_file: output .bz2 is empty or missing: ${tmp_bz2}"
-        rm -f "${tmp_bz2}" "${tmp_sha}"
-        return 1
-    fi
-
-    if [[ ! -f "${tmp_sha}" ]]; then
-        log "ERROR" "compress_one_file: sha256 tmp file missing: ${tmp_sha}"
-        rm -f "${tmp_bz2}"
-        return 1
-    fi
-
-    # Fix the sha256 file: sha256sum writes "<hash>  -" when reading from stdin.
-    # Replace the "-" placeholder with the actual .bz2 filename so the file is
-    # directly usable with "sha256sum -c filename.sha256".
-    local hash_value
-    hash_value=$(awk '{print $1}' "${tmp_sha}")
-    if [[ -z "${hash_value}" ]]; then
-        log "ERROR" "compress_one_file: sha256sum produced empty output for '${internal_path}'"
-        rm -f "${tmp_bz2}" "${tmp_sha}"
-        return 1
-    fi
-
-    printf '%s  %s\n' "${hash_value}" "${bz2_basename}" > "${final_sha}"
-    rm -f "${tmp_sha}"
-
-    # Atomically move compressed output to final name
-    mv "${tmp_bz2}" "${local_bz2_path}"
-
-    local bz2_size
-    bz2_size=$(stat -c "%s" "${local_bz2_path}" 2>/dev/null || echo "?")
-    log "INFO" "compress_one_file: OK '${internal_path}' → ${bz2_basename} (${bz2_size} bytes, sha256=${hash_value})"
-    return 0
-}
-
-# ---------------------------------------------------------------------------
-# enqueue_item LOCAL_BZ2_PATH SHA256_PATH REMOTE_DIR REMOTE_NAME
-#
-# Writes a queue entry file to REPACK_QUEUE_DIR. The filename is prefixed
-# with a zero-padded monotonic counter to guarantee FIFO ordering even when
-# multiple items are enqueued within the same second.
-#
-# Queue entry file format (key=value, one per line):
-#   local_bz2_path=<path>
-#   sha256_path=<path>
-#   remote_dir=<path>
-#   remote_name=<filename>
-#
-# Returns 0 always.
-# ---------------------------------------------------------------------------
-enqueue_item() {
-    local local_bz2_path="$1"
-    local sha256_path="$2"
-    local remote_dir="$3"
-    local remote_name="$4"
-
-    (( _REPACK_QUEUE_COUNTER++ )) || true
-
-    local entry_file
-    entry_file="${REPACK_QUEUE_DIR}/$(printf '%08d' "${_REPACK_QUEUE_COUNTER}").queued"
-
-    cat > "${entry_file}" <<EOF
-local_bz2_path=${local_bz2_path}
-sha256_path=${sha256_path}
-remote_dir=${remote_dir}
-remote_name=${remote_name}
-EOF
-
-    log "DEBUG" "enqueue_item: queued ${remote_name} → ${entry_file}"
-    return 0
-}
-
-# ---------------------------------------------------------------------------
-# dequeue_next_item
-#
-# Finds the oldest (lowest-numbered) .queued file in REPACK_QUEUE_DIR
-# and prints its path to stdout.
-# Returns 0 if an item was found, 1 if the queue is empty.
-# ---------------------------------------------------------------------------
-dequeue_next_item() {
-    local oldest
-    # Use find + sort to get the lowest-numbered .queued file
-    oldest=$(find "${REPACK_QUEUE_DIR}" -maxdepth 1 -name "*.queued" \
-                | sort | head -1)
-
-    if [[ -z "${oldest}" ]]; then
-        return 1
-    fi
-
-    printf '%s' "${oldest}"
-    return 0
-}
-
-# ---------------------------------------------------------------------------
-# _read_queue_entry ENTRY_FILE VAR_BZ2 VAR_SHA VAR_RDIR VAR_RNAME
-#
-# Internal: reads a queue entry file into caller-specified variable names
-# using bash namerefs.
-# ---------------------------------------------------------------------------
-_read_queue_entry() {
-    local entry_file="$1"
-    local -n _rbz2="$2"
-    local -n _rsha="$3"
-    local -n _rrdir="$4"
-    local -n _rrname="$5"
-
-    _rbz2=""
-    _rsha=""
-    _rrdir=""
-    _rrname=""
-
-    local key val line
-    while IFS= read -r line; do
-        key="${line%%=*}"
-        val="${line#*=}"
-        case "${key}" in
-            local_bz2_path) _rbz2="${val}"  ;;
-            sha256_path)    _rsha="${val}"   ;;
-            remote_dir)     _rrdir="${val}"  ;;
-            remote_name)    _rrname="${val}" ;;
-        esac
-    done < "${entry_file}"
-}
-
-# ---------------------------------------------------------------------------
 # upload_one_file LOCAL_BZ2_PATH SHA256_PATH REMOTE_DIR REMOTE_NAME
-#
-# Atomic SFTP upload pipeline:
-#   Step 1: Upload LOCAL_BZ2_PATH to REMOTE_DIR/REMOTE_NAME.tmp_upload
-#   Step 2: Re-download .tmp_upload to a local verify temp file
-#   Step 3: sha256sum the verify file; compare against SHA256_PATH content
-#   Step 4: On match: rename .tmp_upload → REMOTE_DIR/REMOTE_NAME
-#           On mismatch: remove .tmp_upload, return 1
-#
-# The .sha256 file contains a line: "<hash>  <filename>"
-# We extract just the hash for comparison (sha256sum -c is not used here
-# to avoid needing the verify file to be named exactly right).
-#
+# Atomic SFTP upload: put → re-download → sha256 verify → rename.
 # Returns 0 on success, 1 on any failure.
-# ---------------------------------------------------------------------------
 upload_one_file() {
     local local_bz2_path="$1"
     local sha256_path="$2"
@@ -447,9 +453,8 @@ upload_one_file() {
     local remote_final="${remote_dir}/${remote_name}"
     local verify_file="${REPACK_VERIFY_DIR}/${remote_name}.verify"
 
-    log "INFO" "upload_one_file: uploading ${remote_name} → ${remote_dir}"
+    log "INFO" "upload_one_file: ${remote_name} → ${remote_dir}"
 
-    # Read expected hash from .sha256 file
     local expected_hash
     expected_hash=$(awk '{print $1}' "${sha256_path}" 2>/dev/null)
     if [[ -z "${expected_hash}" ]]; then
@@ -457,33 +462,26 @@ upload_one_file() {
         return 1
     fi
 
-    # ------------------------------------------------------------------
-    # Step 1: Upload to .tmp_upload
-    # ------------------------------------------------------------------
+    # Step 1: upload to .tmp_upload
     local rc=0
     _zpaq_sftp_run "put ${local_bz2_path} ${remote_tmp}" || rc=$?
     if (( rc != 0 )); then
-        log "ERROR" "upload_one_file: upload to tmp failed (rc=${rc}): ${remote_tmp}"
+        log "ERROR" "upload_one_file: upload to tmp failed (rc=${rc})"
         return 1
     fi
-    log "DEBUG" "upload_one_file: upload to tmp OK"
 
-    # ------------------------------------------------------------------
-    # Step 2: Re-download for verification
-    # ------------------------------------------------------------------
+    # Step 2: re-download for verification
     rm -f "${verify_file}"
     rc=0
     _zpaq_sftp_run "get ${remote_tmp} ${verify_file}" || rc=$?
     if (( rc != 0 )) || [[ ! -f "${verify_file}" ]]; then
-        log "ERROR" "upload_one_file: re-download failed (rc=${rc}): ${remote_tmp}"
+        log "ERROR" "upload_one_file: re-download failed (rc=${rc})"
         _zpaq_sftp_run "rm ${remote_tmp}" || true
         rm -f "${verify_file}"
         return 1
     fi
 
-    # ------------------------------------------------------------------
-    # Step 3: Verify sha256
-    # ------------------------------------------------------------------
+    # Step 3: verify sha256
     local actual_hash
     actual_hash=$(sha256sum "${verify_file}" 2>/dev/null | awk '{print $1}')
     rm -f "${verify_file}"
@@ -495,15 +493,13 @@ upload_one_file() {
         _zpaq_sftp_run "rm ${remote_tmp}" || true
         return 1
     fi
-    log "DEBUG" "upload_one_file: sha256 OK (${expected_hash})"
+    log "DEBUG" "upload_one_file: sha256 OK"
 
-    # ------------------------------------------------------------------
-    # Step 4: Rename .tmp_upload → final
-    # ------------------------------------------------------------------
+    # Step 4: rename to final
     rc=0
     _zpaq_sftp_run "rename ${remote_tmp} ${remote_final}" || rc=$?
     if (( rc != 0 )); then
-        log "ERROR" "upload_one_file: rename to final failed (rc=${rc}): ${remote_final}"
+        log "ERROR" "upload_one_file: rename failed (rc=${rc})"
         _zpaq_sftp_run "rm ${remote_tmp}" || true
         return 1
     fi
@@ -512,75 +508,308 @@ upload_one_file() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# upload_worker
-#
-# Background polling loop. Runs until:
-#   - The sentinel file REPACK_QUEUE_SENTINEL exists, AND
-#   - The queue directory contains no more .queued files.
-#
-# For each queue entry:
-#   1. Reads the entry file
-#   2. Calls upload_one_file
-#   3. On success: renames .queued → .done
-#   4. On failure: renames .queued → .failed (main loop reports these)
-#
-# Intended usage:
-#   upload_worker &
-#   UPLOAD_WORKER_PID=$!
-#   ...
-#   touch "${REPACK_QUEUE_SENTINEL}"
-#   wait "${UPLOAD_WORKER_PID}"
-#
-# Globals used:
-#   REPACK_QUEUE_DIR, REPACK_QUEUE_SENTINEL, REPACK_VERIFY_DIR
-# ---------------------------------------------------------------------------
-upload_worker() {
-    log "INFO" "upload_worker: started (PID=$$)"
+# ============================================================
+# Queue helpers
+# ============================================================
+
+# _enqueue SUBDIR KEY=VALUE...
+# Internal: write a queue entry file into REPACK_QUEUE_DIR/SUBDIR/.
+# Increments _REPACK_QUEUE_COUNTER; uses zero-padded counter as filename.
+_enqueue() {
+    local subdir="$1"
+    shift
+    (( _REPACK_QUEUE_COUNTER++ )) || true
+    local suffix="pending"
+    [[ "${subdir}" == "upload" ]] && suffix="queued"
+    local entry_file
+    entry_file="${REPACK_QUEUE_DIR}/${subdir}/$(printf '%08d' "${_REPACK_QUEUE_COUNTER}").${suffix}"
+    printf '%s\n' "$@" > "${entry_file}"
+    log "DEBUG" "_enqueue: ${subdir}/$(basename "${entry_file}")"
+}
+
+# _dequeue SUBDIR SUFFIX
+# Internal: find oldest entry in REPACK_QUEUE_DIR/SUBDIR with given SUFFIX.
+# Prints the full path. Returns 1 if empty.
+_dequeue() {
+    local subdir="$1"
+    local suffix="$2"
+    local oldest
+    oldest=$(find "${REPACK_QUEUE_DIR}/${subdir}" -maxdepth 1 -name "*.${suffix}" \
+                | sort | head -1)
+    if [[ -z "${oldest}" ]]; then
+        return 1
+    fi
+    printf '%s' "${oldest}"
+    return 0
+}
+
+# enqueue_extract ZPAQ_PATTERN INTERNAL_PATH UNCOMPRESSED_SIZE
+enqueue_extract() {
+    local zpaq_pattern="$1"
+    local internal_path="$2"
+    local uncompressed_size="$3"
+    _enqueue "extract" \
+        "zpaq_pattern=${zpaq_pattern}" \
+        "internal_path=${internal_path}" \
+        "uncompressed_size=${uncompressed_size}"
+}
+
+# enqueue_compress EXTRACTED_FILE EXTRACT_DIR LOCAL_BZ2_PATH SHA256_PATH REMOTE_DIR REMOTE_NAME
+enqueue_compress() {
+    local extracted_file="$1"
+    local extract_dir="$2"
+    local local_bz2_path="$3"
+    local sha256_path="$4"
+    local remote_dir="$5"
+    local remote_name="$6"
+    _enqueue "compress" \
+        "extracted_file=${extracted_file}" \
+        "extract_dir=${extract_dir}" \
+        "local_bz2_path=${local_bz2_path}" \
+        "sha256_path=${sha256_path}" \
+        "remote_dir=${remote_dir}" \
+        "remote_name=${remote_name}"
+}
+
+# enqueue_upload LOCAL_BZ2_PATH SHA256_PATH REMOTE_DIR REMOTE_NAME
+enqueue_upload() {
+    local local_bz2_path="$1"
+    local sha256_path="$2"
+    local remote_dir="$3"
+    local remote_name="$4"
+    _enqueue "upload" \
+        "local_bz2_path=${local_bz2_path}" \
+        "sha256_path=${sha256_path}" \
+        "remote_dir=${remote_dir}" \
+        "remote_name=${remote_name}"
+}
+
+# dequeue_extract — prints path of oldest extract .pending entry, returns 1 if empty
+dequeue_extract() { _dequeue "extract" "pending"; }
+
+# dequeue_compress — prints path of oldest compress .pending entry, returns 1 if empty
+dequeue_compress() { _dequeue "compress" "pending"; }
+
+# dequeue_upload — prints path of oldest upload .queued entry, returns 1 if empty
+dequeue_upload() { _dequeue "upload" "queued"; }
+
+# _read_entry ENTRY_FILE KEY...
+# Reads key=value pairs from an entry file into variables named after the keys.
+# Uses namerefs — caller must declare the variables before calling.
+_read_entry() {
+    local entry_file="$1"
+    local key val line
+    while IFS= read -r line; do
+        key="${line%%=*}"
+        val="${line#*=}"
+        # Only assign keys that are valid shell identifiers to avoid injection
+        if [[ "${key}" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+            printf -v "${key}" '%s' "${val}"
+        fi
+    done < "${entry_file}"
+}
+
+# ============================================================
+# extract_worker
+# ============================================================
+# Background loop. Drains the extract queue, calls extract_one_file,
+# and populates the compress queue. On exit writes compress/DONE_SENTINEL.
+# ============================================================
+extract_worker() {
+    log "INFO" "extract_worker: started (PID=$$)"
 
     while true; do
-        # Try to dequeue an item
         local entry_file=""
-        entry_file=$(dequeue_next_item) || true
+        entry_file=$(dequeue_extract) || true
 
         if [[ -z "${entry_file}" ]]; then
-            # Queue is empty — check if we should exit
-            if [[ -f "${REPACK_QUEUE_SENTINEL}" ]]; then
-                log "INFO" "upload_worker: queue empty and sentinel present — exiting"
+            if [[ -f "${REPACK_QUEUE_DIR}/extract/DONE_SENTINEL" ]]; then
+                log "INFO" "extract_worker: queue empty + sentinel — exiting"
                 break
             fi
-            # No sentinel yet — wait for more items
             sleep 1
             continue
         fi
 
-        # Read the queue entry
-        local item_bz2 item_sha item_rdir item_rname
-        _read_queue_entry "${entry_file}" item_bz2 item_sha item_rdir item_rname
+        # Read entry fields
+        local zpaq_pattern="" internal_path="" uncompressed_size=""
+        _read_entry "${entry_file}"
 
-        if [[ -z "${item_bz2}" || -z "${item_sha}" || -z "${item_rdir}" || -z "${item_rname}" ]]; then
-            log "ERROR" "upload_worker: malformed queue entry: ${entry_file}"
+        if [[ -z "${zpaq_pattern}" || -z "${internal_path}" ]]; then
+            log "ERROR" "extract_worker: malformed entry: ${entry_file}"
+            mv "${entry_file}" "${entry_file%.pending}.failed"
+            continue
+        fi
+
+        # Determine thread count: burst on first extraction, halved thereafter
+        local threads
+        if [[ "${_FIRST_EXTRACT_DONE}" == "false" ]]; then
+            threads="${THREADS_FIRST_EXTRACT}"
+            _FIRST_EXTRACT_DONE=true
+            log "INFO" "extract_worker: first extraction — using ${threads} threads (burst)"
+        else
+            threads="${THREADS_PIPELINE}"
+        fi
+
+        # Derive output paths
+        local remote_subdir remote_name remote_dir
+        remote_subdir=$(dirname "${internal_path}")
+        remote_name="$(basename "${internal_path}").bz2"
+        if [[ "${remote_subdir}" == "." ]]; then
+            remote_dir="${REPACK_REMOTE_DIR_RESOLVED}"
+        else
+            remote_dir="${REPACK_REMOTE_DIR_RESOLVED}/${remote_subdir}"
+        fi
+        local local_bz2_path="${REPACK_OUTPUT_DIR}/${internal_path}.bz2"
+        local sha256_path="${local_bz2_path}.sha256"
+
+        # Extract
+        local extract_dir=""
+        local extract_rc=0
+        extract_one_file \
+            "${zpaq_pattern}" "${internal_path}" \
+            "${uncompressed_size:-0}" \
+            extract_dir "${threads}" || extract_rc=$?
+
+        if (( extract_rc != 0 )) || [[ -z "${extract_dir}" ]]; then
+            log "ERROR" "extract_worker: extraction failed for '${internal_path}'"
+            mv "${entry_file}" "${entry_file%.pending}.failed"
+            continue
+        fi
+
+        local extracted_file="${extract_dir}/${internal_path}"
+
+        # Mark extract entry done and enqueue to compress
+        mv "${entry_file}" "${entry_file%.pending}.done"
+        enqueue_compress \
+            "${extracted_file}" "${extract_dir}" \
+            "${local_bz2_path}" "${sha256_path}" \
+            "${remote_dir}" "${remote_name}"
+    done
+
+    # Propagate sentinel downstream
+    touch "${REPACK_QUEUE_DIR}/compress/DONE_SENTINEL"
+    log "INFO" "extract_worker: wrote compress/DONE_SENTINEL"
+    log "INFO" "extract_worker: exiting"
+}
+
+# ============================================================
+# compress_worker
+# ============================================================
+# Background loop. Drains the compress queue, calls compress_one_file,
+# removes the extraction directory (freeing RAM/disk), and populates the
+# upload queue. On exit writes upload/DONE_SENTINEL.
+# ============================================================
+compress_worker() {
+    log "INFO" "compress_worker: started (PID=$$)"
+
+    while true; do
+        local entry_file=""
+        entry_file=$(dequeue_compress) || true
+
+        if [[ -z "${entry_file}" ]]; then
+            if [[ -f "${REPACK_QUEUE_DIR}/compress/DONE_SENTINEL" ]]; then
+                log "INFO" "compress_worker: queue empty + sentinel — exiting"
+                break
+            fi
+            sleep 1
+            continue
+        fi
+
+        # Read entry fields
+        local extracted_file="" extract_dir="" local_bz2_path="" \
+              sha256_path="" remote_dir="" remote_name=""
+        _read_entry "${entry_file}"
+
+        if [[ -z "${extracted_file}" || -z "${local_bz2_path}" ]]; then
+            log "ERROR" "compress_worker: malformed entry: ${entry_file}"
+            mv "${entry_file}" "${entry_file%.pending}.failed"
+            continue
+        fi
+
+        # Verify extracted file still exists (may have been cleaned up if script
+        # was interrupted and restarted with a stale compress queue entry)
+        if [[ ! -f "${extracted_file}" ]]; then
+            log "ERROR" "compress_worker: extracted file missing (stale entry?): ${extracted_file}"
+            mv "${entry_file}" "${entry_file%.pending}.failed"
+            continue
+        fi
+
+        # Compress
+        local compress_rc=0
+        compress_one_file "${extracted_file}" "${local_bz2_path}" || compress_rc=$?
+
+        # Always clean up the extraction directory to free RAM/disk
+        if [[ -n "${extract_dir}" && -d "${extract_dir}" ]]; then
+            rm -rf "${extract_dir}"
+            log "DEBUG" "compress_worker: cleaned up extract_dir ${extract_dir}"
+        fi
+
+        if (( compress_rc != 0 )); then
+            log "ERROR" "compress_worker: compression failed for $(basename "${local_bz2_path}")"
+            mv "${entry_file}" "${entry_file%.pending}.failed"
+            continue
+        fi
+
+        # Mark compress entry done and enqueue to upload
+        mv "${entry_file}" "${entry_file%.pending}.done"
+        enqueue_upload \
+            "${local_bz2_path}" "${sha256_path}" \
+            "${remote_dir}" "${remote_name}"
+    done
+
+    # Propagate sentinel downstream
+    touch "${REPACK_QUEUE_DIR}/upload/DONE_SENTINEL"
+    log "INFO" "compress_worker: wrote upload/DONE_SENTINEL"
+    log "INFO" "compress_worker: exiting"
+}
+
+# ============================================================
+# upload_worker
+# ============================================================
+# Background loop. Drains the upload queue, calls upload_one_file,
+# marks entries .done or .failed. Exits when upload/DONE_SENTINEL
+# exists and queue is empty.
+# ============================================================
+upload_worker() {
+    log "INFO" "upload_worker: started (PID=$$)"
+
+    while true; do
+        local entry_file=""
+        entry_file=$(dequeue_upload) || true
+
+        if [[ -z "${entry_file}" ]]; then
+            if [[ -f "${REPACK_QUEUE_DIR}/upload/DONE_SENTINEL" ]]; then
+                log "INFO" "upload_worker: queue empty + sentinel — exiting"
+                break
+            fi
+            sleep 1
+            continue
+        fi
+
+        # Read entry fields
+        local local_bz2_path="" sha256_path="" remote_dir="" remote_name=""
+        _read_entry "${entry_file}"
+
+        if [[ -z "${local_bz2_path}" || -z "${remote_dir}" || -z "${remote_name}" ]]; then
+            log "ERROR" "upload_worker: malformed entry: ${entry_file}"
             mv "${entry_file}" "${entry_file%.queued}.failed"
             continue
         fi
 
-        log "DEBUG" "upload_worker: processing ${item_rname}"
+        ensure_remote_dir "${remote_dir}"
 
-        # Ensure remote directory exists before uploading
-        ensure_remote_dir "${item_rdir}"
-
-        # Upload
         local upload_rc=0
         upload_one_file \
-            "${item_bz2}" "${item_sha}" "${item_rdir}" "${item_rname}" \
-            || upload_rc=$?
+            "${local_bz2_path}" "${sha256_path}" \
+            "${remote_dir}" "${remote_name}" || upload_rc=$?
 
         if (( upload_rc == 0 )); then
             mv "${entry_file}" "${entry_file%.queued}.done"
-            log "INFO" "upload_worker: done ${item_rname}"
+            log "INFO" "upload_worker: done ${remote_name}"
         else
             mv "${entry_file}" "${entry_file%.queued}.failed"
-            log "ERROR" "upload_worker: FAILED ${item_rname} — marked as failed"
+            log "ERROR" "upload_worker: FAILED ${remote_name}"
         fi
     done
 

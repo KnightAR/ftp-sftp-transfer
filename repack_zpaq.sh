@@ -11,19 +11,29 @@
 #   slim/vxtl_helium_20231101.sql  →  <output_dir>/slim/vxtl_helium_20231101.sql.bz2
 #                                  →  <SFTP_REMOTE_DIR>/slim/vxtl_helium_20231101.sql.bz2
 #
-# Skip logic (no overwrite):
-#   1. If the file already exists on the SFTP remote → skip entirely
-#   2. If the local .bz2 already exists on disk → skip compress, upload directly
-#   3. Otherwise → extract+compress → upload
-#
 # Concurrency model:
-#   - One compress slot (pbzip2 uses all cores via -p autodetect)
-#   - One background upload worker (filesystem queue in temp dir)
-#   - Compress and upload overlap: while file N+1 is compressing,
-#     file N is uploading in the background
+#   Three overlapping background workers connected by filesystem queues:
+#     Extract worker  — zpaqfranz x to ramdisk/disk (multithreaded)
+#     Compress worker — pbzip2 from extracted file (multithreaded)
+#     Upload worker   — SFTP atomic put+verify+rename (I/O bound)
 #
-# Version : 1.0.0
-# Requires: zpaqfranz, pbzip2, sha256sum, sshpass, sftp
+# Thread allocation:
+#   THREADS_FIRST_EXTRACT = nproc - 1   (burst, first extraction only)
+#   THREADS_PIPELINE      = floor((nproc-1)/2)  (steady state, shared)
+#   pbzip2 uses THREADS_PIPELINE via -p flag
+#
+# Ramdisk:
+#   A tmpfs is mounted at ZPAQ_TEMP_DIR/ramdisk/ sized at MemAvailable/2.
+#   Files that fit within available headroom are extracted there (faster I/O).
+#   Falls back to ZPAQ_TEMP_DIR/disk/ if ramdisk is unavailable or full.
+#
+# Skip logic (no overwrite):
+#   1. Remote file already exists on SFTP → skip entirely
+#   2. Local .bz2 + .sha256 already exist → skip extract+compress, upload directly
+#   3. Otherwise → extract → compress → upload
+#
+# Version : 2.0.0
+# Requires: zpaqfranz, pbzip2, sha256sum, sshpass, sftp, sudo (for mount)
 #
 # Usage:
 #   ./repack_zpaq.sh [OPTIONS] <archive.zpaq|'pattern???????.zpaq'> [...]
@@ -34,7 +44,6 @@
 #   -p PASS     SFTP password override
 #   -o DIR      Local output directory for .bz2 files (default: ./repack_output)
 #   -r DIR      Remote SFTP base directory override   (default: SFTP_REMOTE_DIR from config)
-#   -T N        pbzip2 thread count                   (default: pbzip2 autodetect)
 #   -b N        pbzip2 block size in 100KB steps      (default: 100 = 10MB)
 #   -m N        pbzip2 memory limit in MB             (default: 2000)
 #   -dry-run    Show what would happen; make no changes
@@ -43,12 +52,13 @@
 #
 # Config file variables (transfer.conf):
 #   SFTP_HOST, SFTP_PORT, SFTP_USER, SFTP_PASS, SFTP_REMOTE_DIR
+#   ZPAQ_TEMP_DIR           (temp/ramdisk root; default: /tmp/repack_<user>)
 #   REPACK_OUTPUT_DIR       (default: ./repack_output)
 #   REPACK_REMOTE_DIR       (overrides SFTP_REMOTE_DIR for repack uploads)
 #   REPACK_PBZIP2_BLOCK     (default: 100)
 #   REPACK_PBZIP2_MEMORY    (default: 2000)
 #
-# Lock file:  <output_dir>/<script_name>.lock
+# Lock file:  <output_dir>/repack_zpaq.sh.lock
 # Log file:   <output_dir>/logs/repack_<timestamp>.log
 # ============================================================
 
@@ -82,13 +92,12 @@ CLI_USER=""
 CLI_PASS=""
 CLI_OUTPUT_DIR=""
 CLI_REMOTE_DIR=""
-CLI_PBZIP2_THREADS=0       # 0 = pbzip2 autodetect
-CLI_PBZIP2_BLOCK=0         # 0 = use config/default
-CLI_PBZIP2_MEMORY=0        # 0 = use config/default
+CLI_PBZIP2_BLOCK=0
+CLI_PBZIP2_MEMORY=0
 CLI_DRY_RUN=false
 CLI_VERBOSE=false
 
-# Positional arguments: input archive patterns
+# Positional arguments
 ARG_ARCHIVES=()
 
 # Runtime state
@@ -97,29 +106,38 @@ LOCK_FILE=""
 LOG_FILE=""
 ERROR_LOG_FILE=""
 
-# Temp directories (set up in setup_temp_dirs)
-REPACK_TEMP_DIR=""         # root temp dir (from ZPAQ_TEMP_DIR config or default)
-REPACK_QUEUE_DIR=""        # stable upload queue dir (persists across re-runs)
-REPACK_QUEUE_SENTINEL=""   # sentinel file path (signals queue is closed)
-REPACK_VERIFY_DIR=""       # ephemeral re-download verification files (mktemp)
+# Temp / ramdisk paths
+REPACK_TEMP_DIR=""
+RAMDISK_PATH=""
+RAMDISK_AVAILABLE="false"
+RAMDISK_CAP_BYTES=0
 
-# Upload worker PID (set after background launch)
+# Queue layout
+REPACK_QUEUE_DIR=""
+
+# Worker PIDs
+EXTRACT_WORKER_PID=""
+COMPRESS_WORKER_PID=""
 UPLOAD_WORKER_PID=""
 
-# Resolved config values (set by load_repack_config)
+# Thread counts (calculated in calc_threads)
+THREADS_FIRST_EXTRACT=1
+THREADS_PIPELINE=1
+
+# Resolved config values
 PBZIP2_BLOCK=""
 PBZIP2_MEMORY=""
-PBZIP2_THREADS=""
 REPACK_OUTPUT_DIR=""
 REPACK_REMOTE_DIR_RESOLVED=""
+REPACK_VERIFY_DIR=""
 
-# Stats counters
+# Stats
 STAT_TOTAL=0
 STAT_SKIPPED_REMOTE=0
 STAT_SKIPPED_LOCAL=0
-STAT_COMPRESSED=0
-STAT_ENQUEUED=0
-STAT_FAILED_COMPRESS=0
+STAT_ENQUEUED_EXTRACT=0
+STAT_ENQUEUED_UPLOAD=0
+STAT_FAILED_LIST=0
 
 # ============================================================
 # usage
@@ -128,10 +146,8 @@ usage() {
     cat <<EOF
 Usage: ${SCRIPT_NAME} [OPTIONS] <archive.zpaq> [<archive.zpaq> ...]
 
-Extracts files from .zpaq archives, recompresses them to .bz2, and
-uploads to SFTP. Subpaths inside the archive are preserved.
-
-Pass multipart archives as a quoted glob pattern:
+Extracts files from .zpaq archives, recompresses to .bz2, uploads to SFTP.
+Subpaths inside the archive are preserved. Multipart archives via glob:
   ${SCRIPT_NAME} 'vxtl_helium???????.zpaq'
 
 Options:
@@ -139,18 +155,16 @@ Options:
   -u USER     SFTP username override
   -p PASS     SFTP password override
   -o DIR      Local output directory for .bz2 files (default: ./repack_output)
-  -r DIR      Remote SFTP base directory override   (default: SFTP_REMOTE_DIR from config)
-  -T N        pbzip2 thread count                   (default: autodetect)
+  -r DIR      Remote SFTP base directory override   (default: SFTP_REMOTE_DIR)
   -b N        pbzip2 block size in 100KB steps      (default: 100 = 10MB)
   -m N        pbzip2 memory limit in MB             (default: 2000)
   -dry-run    Show what would happen; make no changes
   -v          Verbose / DEBUG output
   -h          Show this help and exit
 
-Config file variables: SFTP_HOST, SFTP_PORT, SFTP_USER, SFTP_PASS,
-                       SFTP_REMOTE_DIR, REPACK_OUTPUT_DIR,
-                       REPACK_REMOTE_DIR, REPACK_PBZIP2_BLOCK,
-                       REPACK_PBZIP2_MEMORY
+Config: SFTP_HOST, SFTP_PORT, SFTP_USER, SFTP_PASS, SFTP_REMOTE_DIR,
+        ZPAQ_TEMP_DIR, REPACK_OUTPUT_DIR, REPACK_REMOTE_DIR,
+        REPACK_PBZIP2_BLOCK, REPACK_PBZIP2_MEMORY
 EOF
 }
 
@@ -160,17 +174,16 @@ EOF
 parse_args() {
     while (( $# > 0 )); do
         case "$1" in
-            -c)         CLI_CONFIG="$2";         shift 2 ;;
-            -u)         CLI_USER="$2";            shift 2 ;;
-            -p)         CLI_PASS="$2";            shift 2 ;;
-            -o)         CLI_OUTPUT_DIR="$2";      shift 2 ;;
-            -r)         CLI_REMOTE_DIR="$2";      shift 2 ;;
-            -T)         CLI_PBZIP2_THREADS="$2";  shift 2 ;;
-            -b)         CLI_PBZIP2_BLOCK="$2";    shift 2 ;;
-            -m)         CLI_PBZIP2_MEMORY="$2";   shift 2 ;;
-            -dry-run)   CLI_DRY_RUN=true;         shift   ;;
-            -v)         CLI_VERBOSE=true;          shift   ;;
-            -h|--help)  usage; exit 0             ;;
+            -c)         CLI_CONFIG="$2";        shift 2 ;;
+            -u)         CLI_USER="$2";           shift 2 ;;
+            -p)         CLI_PASS="$2";           shift 2 ;;
+            -o)         CLI_OUTPUT_DIR="$2";     shift 2 ;;
+            -r)         CLI_REMOTE_DIR="$2";     shift 2 ;;
+            -b)         CLI_PBZIP2_BLOCK="$2";   shift 2 ;;
+            -m)         CLI_PBZIP2_MEMORY="$2";  shift 2 ;;
+            -dry-run)   CLI_DRY_RUN=true;        shift   ;;
+            -v)         CLI_VERBOSE=true;         shift   ;;
+            -h|--help)  usage; exit 0            ;;
             -*)
                 echo "ERROR: Unknown option: $1" >&2
                 usage >&2
@@ -207,42 +220,41 @@ load_repack_config() {
     fi
 
     # CLI overrides
-    [[ -n "${CLI_USER}" ]]  && SFTP_USER="${CLI_USER}"
-    [[ -n "${CLI_PASS}" ]]  && SFTP_PASS="${CLI_PASS}"
+    [[ -n "${CLI_USER}" ]] && SFTP_USER="${CLI_USER}"
+    [[ -n "${CLI_PASS}" ]] && SFTP_PASS="${CLI_PASS}"
 
-    # SFTP connectivity defaults
+    # SFTP defaults
     : "${SFTP_HOST:=}"
     : "${SFTP_PORT:=22}"
     : "${SFTP_USER:=}"
     : "${SFTP_PASS:=}"
     : "${SFTP_REMOTE_DIR:=}"
 
-    # Repack-specific config with defaults
+    # Repack defaults
     : "${REPACK_OUTPUT_DIR:=./repack_output}"
-    : "${REPACK_REMOTE_DIR:=}"          # falls back to SFTP_REMOTE_DIR if unset
+    : "${REPACK_REMOTE_DIR:=}"
     : "${REPACK_PBZIP2_BLOCK:=100}"
     : "${REPACK_PBZIP2_MEMORY:=2000}"
 
-    # Temp dir — same variable as storezpaq_multi.sh uses so operators have
-    # a single knob for all temp storage.  Defaults to /tmp if not set.
+    # Temp dir — shared with storezpaq_multi.sh
     : "${ZPAQ_TEMP_DIR:=}"
 
     # Logging
     : "${LOG_DIR:=}"
     : "${LOG_RETENTION_DAYS:=30}"
 
-    # CLI overrides for output dir and remote dir
-    [[ -n "${CLI_OUTPUT_DIR}" ]]  && REPACK_OUTPUT_DIR="${CLI_OUTPUT_DIR}"
-    [[ -n "${CLI_REMOTE_DIR}" ]]  && REPACK_REMOTE_DIR="${CLI_REMOTE_DIR}"
+    # CLI overrides
+    [[ -n "${CLI_OUTPUT_DIR}" ]] && REPACK_OUTPUT_DIR="${CLI_OUTPUT_DIR}"
+    [[ -n "${CLI_REMOTE_DIR}" ]] && REPACK_REMOTE_DIR="${CLI_REMOTE_DIR}"
 
-    # Resolve remote dir: CLI/config override, then fall back to SFTP_REMOTE_DIR
+    # Resolve remote dir
     if [[ -n "${REPACK_REMOTE_DIR}" ]]; then
         REPACK_REMOTE_DIR_RESOLVED="${REPACK_REMOTE_DIR}"
     else
         REPACK_REMOTE_DIR_RESOLVED="${SFTP_REMOTE_DIR}"
     fi
 
-    # pbzip2 tuning — CLI flags take priority over config
+    # pbzip2 tuning (CLI overrides config)
     if (( CLI_PBZIP2_BLOCK > 0 )); then
         PBZIP2_BLOCK="${CLI_PBZIP2_BLOCK}"
     else
@@ -253,14 +265,6 @@ load_repack_config() {
         PBZIP2_MEMORY="${CLI_PBZIP2_MEMORY}"
     else
         PBZIP2_MEMORY="${REPACK_PBZIP2_MEMORY}"
-    fi
-
-    # pbzip2 thread flag: only pass -p if explicitly requested
-    # (default: let pbzip2 autodetect via its own nproc logic)
-    if (( CLI_PBZIP2_THREADS > 0 )); then
-        PBZIP2_THREADS="${CLI_PBZIP2_THREADS}"
-    else
-        PBZIP2_THREADS=0   # 0 = autodetect (no -p flag passed to pbzip2)
     fi
 }
 
@@ -284,24 +288,35 @@ validate_repack_config() {
     _require_var "REPACK_REMOTE_DIR_RESOLVED"
 
     if (( errors > 0 )); then
-        echo "ERROR: ${errors} required configuration variable(s) missing. Check ${CLI_CONFIG}." >&2
+        echo "ERROR: ${errors} required configuration variable(s) missing." >&2
         exit 1
     fi
 
     if ! [[ "${SFTP_PORT}" =~ ^[0-9]+$ ]]; then
-        echo "ERROR: SFTP_PORT must be a number, got: '${SFTP_PORT}'" >&2
-        exit 1
+        echo "ERROR: SFTP_PORT must be a number, got: '${SFTP_PORT}'" >&2; exit 1
     fi
-
     if ! [[ "${PBZIP2_BLOCK}" =~ ^[0-9]+$ ]] || (( PBZIP2_BLOCK < 1 )); then
-        echo "ERROR: pbzip2 block size must be a positive integer, got: '${PBZIP2_BLOCK}'" >&2
-        exit 1
+        echo "ERROR: pbzip2 block size must be a positive integer, got: '${PBZIP2_BLOCK}'" >&2; exit 1
     fi
-
     if ! [[ "${PBZIP2_MEMORY}" =~ ^[0-9]+$ ]] || (( PBZIP2_MEMORY < 1 )); then
-        echo "ERROR: pbzip2 memory limit must be a positive integer (MB), got: '${PBZIP2_MEMORY}'" >&2
-        exit 1
+        echo "ERROR: pbzip2 memory limit must be a positive integer (MB), got: '${PBZIP2_MEMORY}'" >&2; exit 1
     fi
+}
+
+# ============================================================
+# Thread count calculation
+# ============================================================
+calc_threads() {
+    local nproc_val
+    nproc_val=$(nproc 2>/dev/null || echo 1)
+
+    THREADS_FIRST_EXTRACT=$(( nproc_val - 1 ))
+    (( THREADS_FIRST_EXTRACT < 1 )) && THREADS_FIRST_EXTRACT=1
+
+    THREADS_PIPELINE=$(( (nproc_val - 1) / 2 ))
+    (( THREADS_PIPELINE < 1 )) && THREADS_PIPELINE=1
+
+    log "INFO" "calc_threads: nproc=${nproc_val} first_extract=${THREADS_FIRST_EXTRACT} pipeline=${THREADS_PIPELINE}"
 }
 
 # ============================================================
@@ -316,7 +331,6 @@ setup_repack_logging() {
     fi
     mkdir -p "${log_dir}"
     LOG_DIR="${log_dir}"
-
     local timestamp
     timestamp=$(date '+%Y%m%d_%H%M%S')
     LOG_FILE="${log_dir}/repack_${timestamp}.log"
@@ -325,36 +339,40 @@ setup_repack_logging() {
 }
 
 # ============================================================
-# Temp directory setup
-#
-# Queue dir is stable and deterministic so re-runs can resume leftover
-# .queued items from a previous interrupted run.
-# Verify dir is ephemeral (mktemp) since it only holds transient
-# re-download files during upload verification.
+# Temp / ramdisk / queue directory setup
 # ============================================================
 setup_temp_dirs() {
-    # Root temp dir: use ZPAQ_TEMP_DIR from config if set, else /tmp
+    # Root temp dir
     if [[ -n "${ZPAQ_TEMP_DIR}" ]]; then
         REPACK_TEMP_DIR="${ZPAQ_TEMP_DIR}/repack"
     else
         REPACK_TEMP_DIR="/tmp/repack_${USER:-$(id -un)}"
     fi
 
-    # Stable queue dir: fixed path, persists across re-runs for resume
+    # Ramdisk path (under temp dir)
+    RAMDISK_PATH="${REPACK_TEMP_DIR}/ramdisk"
+
+    # Stable queue dir (persists across re-runs for resume)
     REPACK_QUEUE_DIR="${REPACK_TEMP_DIR}/queue"
-    REPACK_QUEUE_SENTINEL="${REPACK_QUEUE_DIR}/DONE_SENTINEL"
 
-    # Create the root temp dir and queue dir before mktemp runs
-    mkdir -p "${REPACK_TEMP_DIR}" "${REPACK_QUEUE_DIR}"
-
-    # Ephemeral verify dir: unique per run (holds transient download files)
+    # Ephemeral verify dir (unique per run)
+    mkdir -p "${REPACK_TEMP_DIR}"
     REPACK_VERIFY_DIR=$(mktemp -d "${REPACK_TEMP_DIR}/verify_$$.XXXXXX")
 
-    log "INFO" "setup_temp_dirs: queue=${REPACK_QUEUE_DIR} verify=${REPACK_VERIFY_DIR}"
+    # Create queue subdirs
+    mkdir -p \
+        "${REPACK_QUEUE_DIR}/extract" \
+        "${REPACK_QUEUE_DIR}/compress" \
+        "${REPACK_QUEUE_DIR}/upload" \
+        "${REPACK_TEMP_DIR}/disk"
+
+    log "INFO" "setup_temp_dirs: root=${REPACK_TEMP_DIR}"
+    log "INFO" "setup_temp_dirs: queue=${REPACK_QUEUE_DIR}"
+    log "DEBUG" "setup_temp_dirs: verify=${REPACK_VERIFY_DIR}"
 }
 
 # ============================================================
-# Lock file management
+# Lock file
 # ============================================================
 acquire_repack_lock() {
     LOCK_FILE="${REPACK_OUTPUT_DIR}/${SCRIPT_NAME}.lock"
@@ -373,7 +391,6 @@ acquire_repack_lock() {
 release_repack_lock() {
     flock -u "${LOCK_FD}" 2>/dev/null || true
     rm -f "${LOCK_FILE}"
-    log "DEBUG" "release_repack_lock: released"
 }
 
 # ============================================================
@@ -383,24 +400,29 @@ trap_cleanup() {
     local exit_code=$?
     log "DEBUG" "trap_cleanup: exit_code=${exit_code}"
 
-    # Signal upload worker to stop if still running
-    if [[ -n "${UPLOAD_WORKER_PID}" ]] && kill -0 "${UPLOAD_WORKER_PID}" 2>/dev/null; then
-        # Write sentinel so worker exits its loop cleanly
-        touch "${REPACK_QUEUE_SENTINEL}" 2>/dev/null || true
-        # Give it a moment to drain, then kill if still running
-        local i=0
-        while kill -0 "${UPLOAD_WORKER_PID}" 2>/dev/null && (( i < 10 )); do
-            sleep 1
-            (( i++ )) || true
-        done
-        kill "${UPLOAD_WORKER_PID}" 2>/dev/null || true
-    fi
+    # Signal all workers to stop
+    local pid
+    for pid in "${EXTRACT_WORKER_PID}" "${COMPRESS_WORKER_PID}" "${UPLOAD_WORKER_PID}"; do
+        if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+            # Write sentinels so workers exit their loops cleanly
+            touch "${REPACK_QUEUE_DIR}/extract/DONE_SENTINEL" \
+                  "${REPACK_QUEUE_DIR}/compress/DONE_SENTINEL" \
+                  "${REPACK_QUEUE_DIR}/upload/DONE_SENTINEL" 2>/dev/null || true
+            local i=0
+            while kill -0 "${pid}" 2>/dev/null && (( i < 10 )); do
+                sleep 1; (( i++ )) || true
+            done
+            kill "${pid}" 2>/dev/null || true
+        fi
+    done
 
-    # Remove only the ephemeral verify dir — the queue dir is intentionally
-    # kept so that a re-run can resume any leftover .queued items.
+    # Unmount ramdisk
+    ramdisk_umount
+
+    # Remove only the ephemeral verify dir — queue dir is kept for resume
     if [[ -n "${REPACK_VERIFY_DIR}" && -d "${REPACK_VERIFY_DIR}" ]]; then
         rm -rf "${REPACK_VERIFY_DIR}"
-        log "DEBUG" "trap_cleanup: removed verify dir ${REPACK_VERIFY_DIR}"
+        log "DEBUG" "trap_cleanup: removed verify dir"
     fi
 
     release_repack_lock
@@ -412,7 +434,7 @@ trap_cleanup() {
 check_repack_dependencies() {
     local missing=0
     local dep
-    for dep in zpaqfranz pbzip2 sha256sum sshpass sftp; do
+    for dep in zpaqfranz pbzip2 sha256sum sshpass sftp sudo; do
         if ! command -v "${dep}" &>/dev/null; then
             log "ERROR" "Missing required dependency: ${dep}"
             (( missing++ )) || true
@@ -425,60 +447,110 @@ check_repack_dependencies() {
 }
 
 # ============================================================
-# Report upload failures from the queue directory
+# Queue resume: seed counter + count leftover items
 # ============================================================
-report_upload_failures() {
+resume_queue_state() {
+    # Seed _REPACK_QUEUE_COUNTER from the highest existing item number
+    # across all three queue subdirs to avoid collisions with leftovers.
+    local highest=0
+    local qf qnum
+    while IFS= read -r -d $'\0' qf; do
+        qnum=$(basename "${qf}")
+        qnum="${qnum%%.*}"
+        if [[ "${qnum}" =~ ^[0-9]+$ ]] && (( 10#${qnum} > highest )); then
+            highest=$(( 10#${qnum} ))
+        fi
+    done < <(find "${REPACK_QUEUE_DIR}" -maxdepth 2 \
+                \( -name "*.pending" -o -name "*.queued" \
+                   -o -name "*.done"  -o -name "*.failed" \) \
+                -print0 2>/dev/null)
+    _REPACK_QUEUE_COUNTER="${highest}"
+    log "DEBUG" "resume_queue_state: counter seeded to ${_REPACK_QUEUE_COUNTER}"
+
+    # Remove sentinels from prior run so workers don't exit prematurely
+    rm -f \
+        "${REPACK_QUEUE_DIR}/extract/DONE_SENTINEL" \
+        "${REPACK_QUEUE_DIR}/compress/DONE_SENTINEL" \
+        "${REPACK_QUEUE_DIR}/upload/DONE_SENTINEL"
+
+    # Report leftover items by queue
+    local n_extract n_compress n_upload
+    n_extract=$(find "${REPACK_QUEUE_DIR}/extract" -maxdepth 1 -name "*.pending" 2>/dev/null | wc -l)
+    n_compress=$(find "${REPACK_QUEUE_DIR}/compress" -maxdepth 1 -name "*.pending" 2>/dev/null | wc -l)
+    n_upload=$(find "${REPACK_QUEUE_DIR}/upload"  -maxdepth 1 -name "*.queued"  2>/dev/null | wc -l)
+
+    local total_resumed=$(( n_extract + n_compress + n_upload ))
+    if (( total_resumed > 0 )); then
+        log "INFO" "Resuming from previous run: ${n_extract} extract, ${n_compress} compress, ${n_upload} upload item(s)"
+    fi
+}
+
+# ============================================================
+# Cleanup completed queue entries after successful run
+# ============================================================
+cleanup_done_entries() {
+    local done_count=0
+    local df
+    while IFS= read -r -d $'\0' df; do
+        rm -f "${df}"
+        (( done_count++ )) || true
+    done < <(find "${REPACK_QUEUE_DIR}" -maxdepth 2 -name "*.done" -print0 2>/dev/null)
+    if (( done_count > 0 )); then
+        log "DEBUG" "cleanup_done_entries: removed ${done_count} completed entry/entries"
+    fi
+}
+
+# ============================================================
+# Report failures from queue dirs
+# ============================================================
+report_failures() {
     local failed_count=0
     local f
-
     while IFS= read -r -d $'\0' f; do
         (( failed_count++ )) || true
-        # Read the failed entry to get the remote name for the error message
-        # shellcheck disable=SC2034  # item_* vars populated via nameref in _read_queue_entry
-        local item_bz2="" item_sha="" item_rdir="" item_rname=""
-        _read_queue_entry "${f}" item_bz2 item_sha item_rdir item_rname
-        log "ERROR" "Upload FAILED: ${item_rdir}/${item_rname} (local: ${item_bz2})"
-    done < <(find "${REPACK_QUEUE_DIR}" -maxdepth 1 -name "*.failed" -print0 2>/dev/null)
+        # Read the failed entry for context
+        local zpaq_pattern="" internal_path="" extracted_file="" \
+              local_bz2_path="" remote_dir="" remote_name=""
+        _read_entry "${f}"
+        local context="${internal_path:-${local_bz2_path:-${extracted_file:-${f}}}}"
+        log "ERROR" "FAILED entry: ${context} (queue file: $(basename "${f}"))"
+    done < <(find "${REPACK_QUEUE_DIR}" -maxdepth 2 -name "*.failed" -print0 2>/dev/null)
 
     if (( failed_count > 0 )); then
-        log "ERROR" "${failed_count} upload(s) failed — re-run to retry (remote skip logic will resume from where it left off)"
+        log "ERROR" "${failed_count} item(s) failed — re-run to retry (remote skip logic will resume)"
         return 1
     fi
     return 0
 }
 
 # ============================================================
-# Process a single internal file from a zpaq archive
+# Process one file: skip checks, then enqueue to extract (or upload)
 # ============================================================
 process_one_file() {
     local zpaq_pattern="$1"
     local internal_path="$2"
+    local uncompressed_size="$3"
 
     (( STAT_TOTAL++ )) || true
 
-    # Derive local output path: <output_dir>/<internal_path>.bz2
     local local_bz2_path="${REPACK_OUTPUT_DIR}/${internal_path}.bz2"
     local local_sha256_path="${local_bz2_path}.sha256"
 
-    # Derive remote path components
-    local remote_subdir remote_name
+    local remote_subdir remote_name remote_dir
     remote_subdir=$(dirname "${internal_path}")
     remote_name="$(basename "${internal_path}").bz2"
-
-    # Build remote directory: REPACK_REMOTE_DIR_RESOLVED + subdir if any
-    local remote_dir
     if [[ "${remote_subdir}" == "." ]]; then
         remote_dir="${REPACK_REMOTE_DIR_RESOLVED}"
     else
         remote_dir="${REPACK_REMOTE_DIR_RESOLVED}/${remote_subdir}"
     fi
 
-    log "INFO" "process_one_file: ${internal_path}"
+    log "INFO" "process_one_file: ${internal_path} (${uncompressed_size} bytes uncompressed)"
     log "DEBUG" "  local:  ${local_bz2_path}"
     log "DEBUG" "  remote: ${remote_dir}/${remote_name}"
 
     # ------------------------------------------------------------------
-    # Skip check 1: remote file already exists
+    # Skip 1: remote file already exists
     # ------------------------------------------------------------------
     if [[ "${CLI_DRY_RUN}" == false ]]; then
         if remote_file_exists "${remote_dir}" "${remote_name}"; then
@@ -491,10 +563,10 @@ process_one_file() {
     fi
 
     # ------------------------------------------------------------------
-    # Skip check 2: local .bz2 already exists — skip compress, go to upload
+    # Skip 2: local .bz2 + .sha256 already exist — enqueue to upload only
     # ------------------------------------------------------------------
     if [[ -f "${local_bz2_path}" && -f "${local_sha256_path}" ]]; then
-        log "INFO" "  local .bz2 exists — skipping compress, queuing for upload"
+        log "INFO" "  local .bz2 exists — skipping extract+compress, queuing for upload"
         (( STAT_SKIPPED_LOCAL++ )) || true
 
         if [[ "${CLI_DRY_RUN}" == true ]]; then
@@ -502,35 +574,23 @@ process_one_file() {
             return 0
         fi
 
-        enqueue_item "${local_bz2_path}" "${local_sha256_path}" "${remote_dir}" "${remote_name}"
-        (( STAT_ENQUEUED++ )) || true
+        enqueue_upload "${local_bz2_path}" "${local_sha256_path}" "${remote_dir}" "${remote_name}"
+        (( STAT_ENQUEUED_UPLOAD++ )) || true
         return 0
     fi
 
     # ------------------------------------------------------------------
-    # Compress
+    # Enqueue for extract → compress → upload
     # ------------------------------------------------------------------
     if [[ "${CLI_DRY_RUN}" == true ]]; then
         log "INFO" "  DRY-RUN: would extract '${internal_path}' and compress to ${local_bz2_path}"
-        (( STAT_COMPRESSED++ )) || true
+        (( STAT_ENQUEUED_EXTRACT++ )) || true
         return 0
     fi
 
     mkdir -p "$(dirname "${local_bz2_path}")"
-
-    if ! compress_one_file "${zpaq_pattern}" "${internal_path}" "${local_bz2_path}"; then
-        log "ERROR" "  compress failed for '${internal_path}' — skipping"
-        (( STAT_FAILED_COMPRESS++ )) || true
-        return 0   # continue to next file; don't abort entire run
-    fi
-
-    (( STAT_COMPRESSED++ )) || true
-
-    # ------------------------------------------------------------------
-    # Enqueue for upload
-    # ------------------------------------------------------------------
-    enqueue_item "${local_bz2_path}" "${local_sha256_path}" "${remote_dir}" "${remote_name}"
-    (( STAT_ENQUEUED++ )) || true
+    enqueue_extract "${zpaq_pattern}" "${internal_path}" "${uncompressed_size}"
+    (( STAT_ENQUEUED_EXTRACT++ )) || true
 
     return 0
 }
@@ -542,14 +602,12 @@ main() {
     parse_args "$@"
     load_repack_config
 
-    # Create output dir early (needed for lock file and logging)
     mkdir -p "${REPACK_OUTPUT_DIR}"
-
     setup_repack_logging
 
     log "INFO" "===== ${SCRIPT_NAME} starting ====="
     log "INFO" "archives=${#ARG_ARCHIVES[@]} output=${REPACK_OUTPUT_DIR} remote=${REPACK_REMOTE_DIR_RESOLVED}"
-    log "INFO" "pbzip2: block=${PBZIP2_BLOCK}00KB memory=${PBZIP2_MEMORY}MB threads=${PBZIP2_THREADS:-autodetect} level=-9 (extreme)"
+    log "INFO" "pbzip2: block=${PBZIP2_BLOCK}00KB memory=${PBZIP2_MEMORY}MB level=-9"
     log "INFO" "dry-run=${CLI_DRY_RUN}"
 
     validate_repack_config
@@ -559,133 +617,125 @@ main() {
 
     check_repack_dependencies
     detect_zpaqfranz
-    zpaq_calc_threads 0   # sets ZPAQFRANZ_THREADS (used by zpaq_utils functions if needed)
+    calc_threads
 
-    # Export globals needed by zpaq_repack_ops.sh functions
-    # (these are already set as shell variables; exporting ensures they
-    # are visible to the upload_worker subshell launched with &)
+    log "INFO" "threads: first_extract=${THREADS_FIRST_EXTRACT} pipeline=${THREADS_PIPELINE}"
+
+    # Export all globals needed by workers launched with &
     export ZPAQFRANZ_BIN
     export SFTP_HOST SFTP_PORT SFTP_USER SFTP_PASS
-    export REPACK_QUEUE_DIR REPACK_QUEUE_SENTINEL REPACK_VERIFY_DIR
-    export PBZIP2_BLOCK PBZIP2_MEMORY PBZIP2_THREADS
+    export REPACK_QUEUE_DIR REPACK_VERIFY_DIR
+    export REPACK_OUTPUT_DIR REPACK_REMOTE_DIR_RESOLVED
+    export RAMDISK_PATH RAMDISK_AVAILABLE RAMDISK_CAP_BYTES
+    export REPACK_TEMP_DIR
+    export THREADS_FIRST_EXTRACT THREADS_PIPELINE
+    export PBZIP2_BLOCK PBZIP2_MEMORY
     export LOG_FILE ERROR_LOG_FILE CLI_VERBOSE
     export ZPAQ_TEMP_DIR
 
     # ------------------------------------------------------------------
-    # Queue housekeeping: clean up sentinel from any prior run, seed the
-    # monotonic counter from any leftover items, and report resumed items.
+    # Mount ramdisk (dry-run skips mount)
     # ------------------------------------------------------------------
     if [[ "${CLI_DRY_RUN}" == false ]]; then
-        # Remove sentinel from previous run so the worker doesn't exit early
-        rm -f "${REPACK_QUEUE_SENTINEL}"
-
-        # Seed counter from highest existing item number to avoid collisions
-        # with leftover .queued / .done / .failed files from a prior run.
-        local highest=0
-        local qf qnum
-        while IFS= read -r -d $'\0' qf; do
-            qnum=$(basename "${qf}")
-            qnum="${qnum%%.*}"          # strip extension, keep numeric prefix
-            qnum="${qnum##*[^0-9]}"     # strip any non-numeric prefix (safety)
-            if [[ "${qnum}" =~ ^[0-9]+$ ]] && (( qnum > highest )); then
-                highest="${qnum}"
-            fi
-        done < <(find "${REPACK_QUEUE_DIR}" -maxdepth 1 \
-                    \( -name "*.queued" -o -name "*.done" -o -name "*.failed" \) \
-                    -print0 2>/dev/null)
-        _REPACK_QUEUE_COUNTER="${highest}"
-        log "DEBUG" "Queue counter seeded to ${_REPACK_QUEUE_COUNTER}"
-
-        # Count and log any leftover .queued items from a prior interrupted run
-        local resumed=0
-        while IFS= read -r -d $'\0' qf; do
-            (( resumed++ )) || true
-        done < <(find "${REPACK_QUEUE_DIR}" -maxdepth 1 -name "*.queued" -print0 2>/dev/null)
-        if (( resumed > 0 )); then
-            log "INFO" "Resuming ${resumed} leftover queued upload(s) from previous run"
-        fi
+        ramdisk_mount
+        # Re-export after ramdisk_mount may have updated these
+        export RAMDISK_AVAILABLE RAMDISK_CAP_BYTES
     fi
 
     # ------------------------------------------------------------------
-    # Launch upload worker in the background
+    # Queue housekeeping: seed counter, remove prior sentinels, report resume
+    # ------------------------------------------------------------------
+    resume_queue_state
+
+    # ------------------------------------------------------------------
+    # Launch three background workers
     # ------------------------------------------------------------------
     if [[ "${CLI_DRY_RUN}" == false ]]; then
+        extract_worker &
+        EXTRACT_WORKER_PID=$!
+        log "INFO" "Extract worker started (PID=${EXTRACT_WORKER_PID})"
+
+        compress_worker &
+        COMPRESS_WORKER_PID=$!
+        log "INFO" "Compress worker started (PID=${COMPRESS_WORKER_PID})"
+
         upload_worker &
         UPLOAD_WORKER_PID=$!
         log "INFO" "Upload worker started (PID=${UPLOAD_WORKER_PID})"
     fi
 
     # ------------------------------------------------------------------
-    # Main loop: for each archive pattern, list files and process each
+    # Main loop: list each archive and enqueue files
     # ------------------------------------------------------------------
-    local zpaq_pattern internal_path
+    local zpaq_pattern
     local archive_errors=0
 
     for zpaq_pattern in "${ARG_ARCHIVES[@]}"; do
         log "INFO" "===== Processing archive: ${zpaq_pattern} ====="
 
-        # list_zpaq_files prints one internal path per line
-        local file_list=""
-        local list_rc=0
+        local file_list="" list_rc=0
         file_list=$(list_zpaq_files "${zpaq_pattern}") || list_rc=$?
 
         if (( list_rc != 0 )) || [[ -z "${file_list}" ]]; then
-            log "ERROR" "Could not list files in ${zpaq_pattern} — skipping this archive"
+            log "ERROR" "Could not list files in ${zpaq_pattern} — skipping"
             (( archive_errors++ )) || true
+            (( STAT_FAILED_LIST++ )) || true
             continue
         fi
 
-        while IFS= read -r internal_path; do
+        local line uncompressed_size internal_path
+        while IFS= read -r line; do
+            [[ -z "${line}" ]] && continue
+            uncompressed_size="${line%%$'\t'*}"
+            internal_path="${line#*$'\t'}"
             [[ -z "${internal_path}" ]] && continue
-            process_one_file "${zpaq_pattern}" "${internal_path}"
+            process_one_file "${zpaq_pattern}" "${internal_path}" "${uncompressed_size}"
         done <<< "${file_list}"
 
-        log "INFO" "===== Archive done: ${zpaq_pattern} ====="
+        log "INFO" "===== Archive enqueued: ${zpaq_pattern} ====="
     done
 
     # ------------------------------------------------------------------
-    # Signal upload worker that all items have been enqueued
+    # Signal extract worker that all files have been enqueued
     # ------------------------------------------------------------------
     if [[ "${CLI_DRY_RUN}" == false ]]; then
-        log "INFO" "All files processed — signalling upload worker (sentinel)"
-        touch "${REPACK_QUEUE_SENTINEL}"
+        log "INFO" "All archives listed — writing extract/DONE_SENTINEL"
+        touch "${REPACK_QUEUE_DIR}/extract/DONE_SENTINEL"
 
-        log "INFO" "Waiting for upload worker to finish (PID=${UPLOAD_WORKER_PID})..."
+        # Workers propagate sentinels downstream automatically:
+        #   extract_worker writes compress/DONE_SENTINEL on exit
+        #   compress_worker writes upload/DONE_SENTINEL on exit
+        log "INFO" "Waiting for extract worker  (PID=${EXTRACT_WORKER_PID})..."
+        wait "${EXTRACT_WORKER_PID}" || true
+
+        log "INFO" "Waiting for compress worker (PID=${COMPRESS_WORKER_PID})..."
+        wait "${COMPRESS_WORKER_PID}" || true
+
+        log "INFO" "Waiting for upload worker   (PID=${UPLOAD_WORKER_PID})..."
         wait "${UPLOAD_WORKER_PID}" || true
-        log "INFO" "Upload worker exited"
 
-        # Clean up .done entries — they've been successfully uploaded and are
-        # no longer needed. .failed entries are left for operator inspection
-        # and will be re-picked-up on the next run.
-        local done_count=0
-        local df
-        while IFS= read -r -d $'\0' df; do
-            rm -f "${df}"
-            (( done_count++ )) || true
-        done < <(find "${REPACK_QUEUE_DIR}" -maxdepth 1 -name "*.done" -print0 2>/dev/null)
-        if (( done_count > 0 )); then
-            log "DEBUG" "Cleaned up ${done_count} completed queue entry/entries"
-        fi
+        log "INFO" "All workers exited"
+
+        cleanup_done_entries
     fi
 
     # ------------------------------------------------------------------
-    # Report
+    # Summary
     # ------------------------------------------------------------------
     log "INFO" "===== ${SCRIPT_NAME} summary ====="
-    log "INFO" "  Total files seen:        ${STAT_TOTAL}"
-    log "INFO" "  Skipped (remote exists): ${STAT_SKIPPED_REMOTE}"
-    log "INFO" "  Skipped (local .bz2):    ${STAT_SKIPPED_LOCAL}"
-    log "INFO" "  Compressed:              ${STAT_COMPRESSED}"
-    log "INFO" "  Enqueued for upload:     ${STAT_ENQUEUED}"
-    log "INFO" "  Compress failures:       ${STAT_FAILED_COMPRESS}"
+    log "INFO" "  Total files seen:           ${STAT_TOTAL}"
+    log "INFO" "  Skipped (remote exists):    ${STAT_SKIPPED_REMOTE}"
+    log "INFO" "  Skipped (local .bz2):       ${STAT_SKIPPED_LOCAL}"
+    log "INFO" "  Enqueued for extract:       ${STAT_ENQUEUED_EXTRACT}"
+    log "INFO" "  Enqueued for upload only:   ${STAT_ENQUEUED_UPLOAD}"
+    log "INFO" "  Archive list failures:      ${STAT_FAILED_LIST}"
 
-    # Check for upload failures
-    local upload_failures=0
+    local failures=0
     if [[ "${CLI_DRY_RUN}" == false ]]; then
-        report_upload_failures || upload_failures=$?
+        report_failures || failures=$?
     fi
 
-    if (( STAT_FAILED_COMPRESS > 0 || archive_errors > 0 || upload_failures > 0 )); then
+    if (( archive_errors > 0 || failures > 0 )); then
         log "ERROR" "===== ${SCRIPT_NAME} finished with errors ====="
         exit 1
     fi
