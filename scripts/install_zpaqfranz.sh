@@ -236,6 +236,15 @@ MAKE_ARGS=(
     "${MAKE_TARGET}"
 )
 
+# Workaround: the upstream Makefile only adds -ldl when ENABLE_SFTP=yes,
+# but zpaqfranz.cpp uses dlopen() for libsodium (encryption) and libcurl
+# unconditionally on Linux — independent of the SFTP flag.  Without -ldl
+# the linker fails with "undefined reference to dlopen/dlsym/dlclose".
+# Always inject -ldl on Linux until this is fixed upstream.
+if [[ "$(uname -s)" == "Linux" && "${BUILD_STATIC}" != "yes" ]]; then
+    MAKE_ARGS+=( "LDLIBS=-lm -ldl" )
+fi
+
 run make "${MAKE_ARGS[@]}"
 
 if [[ "${DRY_RUN}" != "yes" ]]; then
