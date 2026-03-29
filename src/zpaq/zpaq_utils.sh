@@ -68,6 +68,7 @@ detect_zpaqfranz() {
 
     if (( ver_num > 0 && ver_num < 64007 )); then
         log "WARN" "zpaqfranz ${ver_string} is older than v64.7; -stdinsize is not supported. Forcing ZPAQ_STDINSIZE_HINT=false."
+        # shellcheck disable=SC2034  # ZPAQ_STDINSIZE_HINT is read by zpaq_archive_ops.sh
         ZPAQ_STDINSIZE_HINT="false"
     fi
 }

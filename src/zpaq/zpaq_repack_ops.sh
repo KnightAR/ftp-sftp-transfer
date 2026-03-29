@@ -118,12 +118,13 @@ list_zpaq_files() {
         return 1
     fi
 
-    # Parse: find data lines (start with spaces + date), extract after " + "
+    # Parse: find data lines containing a date field and a " + " marker.
+    # The date may be preceded by optional leading spaces (format varies by build).
     # awk finds the " + " marker and prints everything after it.
     # Trims any trailing carriage returns (Windows-style CRLF from some builds).
     local file_list
     file_list=$(printf '%s\n' "${raw_output}" \
-        | awk '/^[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}/ && / \+ / {
+        | awk '/[0-9]{4}-[0-9]{2}-[0-9]{2}/ && / \+ / {
             idx = index($0, " + ")
             if (idx > 0) {
                 path = substr($0, idx + 3)
