@@ -145,7 +145,7 @@ zpaq_multipart_add() {
     local temp_dir="$3"
 
     local fragment="${ZPAQ_FRAGMENT:-3}"
-    local compression="${ZPAQ_COMPRESSION:--m5}"
+    local compression="${ZPAQ_COMPRESSION:--m58}"
     local extra_flags="${ZPAQ_EXTRA_FLAGS:--ssd}"
     local threads="${ZPAQFRANZ_THREADS:-1}"
     local threshold="${ARGMAX_SAFE_THRESHOLD:-131072}"

@@ -155,9 +155,9 @@ zpaq_test_archive() {
 #
 # Rules:
 #   - If REQUESTED is given and > 0, use it directly (CLI override).
-#   - Otherwise, default to 25% of available nproc, minimum 1, maximum 8.
+#   - Otherwise, default to 25% of available nproc, minimum 1, maximum 16.
 #
-# The 25%/max-8 default is intentional: zpaqfranz compression is CPU-heavy;
+# The 25%/max-16 default is intentional: zpaqfranz compression is CPU-heavy;
 # leaving headroom avoids starving other processes on shared servers.
 #
 # After calling this function, ZPAQFRANZ_THREADS is available globally.
@@ -165,7 +165,7 @@ zpaq_test_archive() {
 # need to pass it explicitly.
 #
 # Usage:
-#   zpaq_calc_threads          # auto: 25% of nproc, max 8
+#   zpaq_calc_threads          # auto: 25% of nproc, max 16
 #   zpaq_calc_threads 4        # explicit: 4 threads
 zpaq_calc_threads() {
     local requested="${1:-0}"
@@ -184,11 +184,11 @@ zpaq_calc_threads() {
         total_cpus=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
     fi
 
-    # 25% of total, rounded down, minimum 1, maximum 8
+    # 25% of total, rounded down, minimum 1, maximum 16
     local calculated=$(( total_cpus / 4 ))
     (( calculated < 1 )) && calculated=1
-    (( calculated > 8 )) && calculated=8
+    (( calculated > 16 )) && calculated=16
 
     ZPAQFRANZ_THREADS="${calculated}"
-    log "DEBUG" "zpaq_calc_threads: total_cpus=${total_cpus} -> threads=${ZPAQFRANZ_THREADS} (25% capped at 8)"
+    log "DEBUG" "zpaq_calc_threads: total_cpus=${total_cpus} -> threads=${ZPAQFRANZ_THREADS} (25% capped at 16)"
 }

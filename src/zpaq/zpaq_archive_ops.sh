@@ -225,8 +225,8 @@ zpaq_add_stdin() {
     # PIPESTATUS[0] captures zpaqfranz's exit code across the tee pipe.
     local rc=0
     "${ZPAQFRANZ_BIN}" a "${archive}" "${internal_name}" \
-        -stdin -m5 -ssd -threads "${threads}" \
-        "${stdinsize_args[@]}" \
+        -stdin -m58 -fragment 3 -ssd -threads "${threads}" \
+        -"${stdinsize_args[@]}" \
         | tee -a "${LOG_FILE:-/dev/null}"
     rc="${PIPESTATUS[0]}"
 
