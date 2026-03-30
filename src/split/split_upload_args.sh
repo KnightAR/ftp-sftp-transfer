@@ -131,7 +131,7 @@ split_upload_parse_args() {
     # shellcheck disable=SC2034
     [[ -n "${UPLOAD_CLI_WORKERS}" ]]       && SPLIT_PART_WORKERS="${UPLOAD_CLI_WORKERS}"
     # shellcheck disable=SC2034
-    [[ "${UPLOAD_CLI_VERBOSE}" == true ]]  && CLI_VERBOSE=true
+    [[ "${UPLOAD_CLI_VERBOSE}" == true ]]  && CLI_VERBOSE=true || true
     # UPLOAD_CLI_REMOTE_PATH, UPLOAD_CLI_TEMP_DIR, UPLOAD_CLI_DELETE are read
     # directly by split_upload_main() in split_upload.sh — not propagated here.
 }

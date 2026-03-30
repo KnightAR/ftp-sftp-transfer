@@ -123,7 +123,7 @@ split_parse_args() {
     # shellcheck disable=SC2034
     [[ -n "${SPLIT_CLI_WORKERS}" ]]      && SPLIT_PART_WORKERS="${SPLIT_CLI_WORKERS}"
     # shellcheck disable=SC2034
-    [[ -n "${SPLIT_CLI_TEMP_DIR}" ]]     && TEMP_DIR="${SPLIT_CLI_TEMP_DIR}"
+    [[ -n "${SPLIT_CLI_TEMP_DIR}" ]]     && TEMP_DIR="${SPLIT_CLI_TEMP_DIR}" || true
     # shellcheck disable=SC2034
-    [[ "${SPLIT_CLI_VERBOSE}" == true ]] && CLI_VERBOSE=true
+    [[ "${SPLIT_CLI_VERBOSE}" == true ]] && CLI_VERBOSE=true || true
 }

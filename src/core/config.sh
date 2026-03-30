@@ -42,14 +42,14 @@ load_config() {
     source "${config_file}"
 
     # Apply CLI overrides (flags take precedence over config values)
-    [[ -n "${CLI_EXCLUDE_LIST}" ]]    && EXCLUDE_LIST="${CLI_EXCLUDE_LIST}"
-    [[ -n "${CLI_TEMP_DIR}" ]]        && TEMP_DIR="${CLI_TEMP_DIR}"
-    [[ -n "${CLI_DRY_RUN}" ]]         && DRY_RUN="${CLI_DRY_RUN}"
-    [[ -n "${CLI_DELETE_FROM_FTP}" ]] && DELETE_FROM_FTP="${CLI_DELETE_FROM_FTP}"
-    [[ -n "${CLI_FTP_WORKERS}" ]]     && FTP_MAX_WORKERS="${CLI_FTP_WORKERS}"
-    [[ -n "${CLI_SFTP_WORKERS}" ]]    && SFTP_MAX_WORKERS="${CLI_SFTP_WORKERS}"
+    [[ -n "${CLI_EXCLUDE_LIST}" ]]    && EXCLUDE_LIST="${CLI_EXCLUDE_LIST}"    || true
+    [[ -n "${CLI_TEMP_DIR}" ]]        && TEMP_DIR="${CLI_TEMP_DIR}"          || true
+    [[ -n "${CLI_DRY_RUN}" ]]         && DRY_RUN="${CLI_DRY_RUN}"            || true
+    [[ -n "${CLI_DELETE_FROM_FTP}" ]] && DELETE_FROM_FTP="${CLI_DELETE_FROM_FTP}" || true
+    [[ -n "${CLI_FTP_WORKERS}" ]]     && FTP_MAX_WORKERS="${CLI_FTP_WORKERS}" || true
+    [[ -n "${CLI_SFTP_WORKERS}" ]]    && SFTP_MAX_WORKERS="${CLI_SFTP_WORKERS}" || true
     # -V flag always wins — once set on the CLI it cannot be overridden by config
-    [[ "${CLI_VERIFY_MODE}" == true ]] && VERIFY_MODE="true"
+    [[ "${CLI_VERIFY_MODE}" == true ]] && VERIFY_MODE="true" || true
 
     # Apply defaults for optional variables not set in the config file.
     # Credentials and host/path values have no safe defaults and are

@@ -143,9 +143,9 @@ split_upload_main() {
     validate_split_config
 
     # ---- Apply CLI overrides ----
-    [[ -n "${UPLOAD_CLI_WORKERS:-}"  ]] && SPLIT_PART_WORKERS="${UPLOAD_CLI_WORKERS}"
-    [[ -n "${UPLOAD_CLI_TEMP_DIR:-}" ]] && SPLIT_TEMP_DIR="${UPLOAD_CLI_TEMP_DIR}"
-    [[ "${UPLOAD_CLI_VERBOSE:-false}" == true ]] && CLI_VERBOSE=true
+    [[ -n "${UPLOAD_CLI_WORKERS:-}"  ]] && SPLIT_PART_WORKERS="${UPLOAD_CLI_WORKERS}" || true
+    [[ -n "${UPLOAD_CLI_TEMP_DIR:-}" ]] && SPLIT_TEMP_DIR="${UPLOAD_CLI_TEMP_DIR}" || true
+    [[ "${UPLOAD_CLI_VERBOSE:-false}" == true ]] && CLI_VERBOSE=true || true
 
     # ---- Resolve TEMP_DIR ----
     if [[ -n "${SPLIT_TEMP_DIR:-}" ]]; then

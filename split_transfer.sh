@@ -195,10 +195,10 @@ split_main() {
     validate_split_config
 
     # Override split settings from CLI flags if provided
-    [[ -n "${SPLIT_CLI_SIZE}"     ]] && SPLIT_SIZE="${SPLIT_CLI_SIZE}"
-    [[ -n "${SPLIT_CLI_WORKERS}"  ]] && SPLIT_PART_WORKERS="${SPLIT_CLI_WORKERS}"
+    [[ -n "${SPLIT_CLI_SIZE}"     ]] && SPLIT_SIZE="${SPLIT_CLI_SIZE}"          || true
+    [[ -n "${SPLIT_CLI_WORKERS}"  ]] && SPLIT_PART_WORKERS="${SPLIT_CLI_WORKERS}" || true
     # -t flag overrides SPLIT_TEMP_DIR from config
-    [[ -n "${SPLIT_CLI_TEMP_DIR}" ]] && SPLIT_TEMP_DIR="${SPLIT_CLI_TEMP_DIR}"
+    [[ -n "${SPLIT_CLI_TEMP_DIR}" ]] && SPLIT_TEMP_DIR="${SPLIT_CLI_TEMP_DIR}"   || true
 
     # If SPLIT_TEMP_DIR is explicitly set (config or -t flag), use it as TEMP_DIR.
     # Otherwise fall back to TEMP_DIR (from config or mktemp via setup_temp_dir).

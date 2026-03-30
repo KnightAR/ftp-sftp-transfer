@@ -265,9 +265,9 @@ restore_main() {
     validate_split_config
 
     # Override settings from CLI flags if provided
-    [[ -n "${RESTORE_CLI_WORKERS}"  ]] && SPLIT_RESTORE_WORKERS="${RESTORE_CLI_WORKERS}"
+    [[ -n "${RESTORE_CLI_WORKERS}"  ]] && SPLIT_RESTORE_WORKERS="${RESTORE_CLI_WORKERS}" || true
     # -t flag overrides SPLIT_TEMP_DIR from config
-    [[ -n "${RESTORE_CLI_TEMP_DIR}" ]] && SPLIT_TEMP_DIR="${RESTORE_CLI_TEMP_DIR}"
+    [[ -n "${RESTORE_CLI_TEMP_DIR}" ]] && SPLIT_TEMP_DIR="${RESTORE_CLI_TEMP_DIR}" || true
 
     # If SPLIT_TEMP_DIR is explicitly set (config or -t flag), use it as TEMP_DIR.
     # Otherwise fall back to TEMP_DIR (from config or mktemp via setup_temp_dir).
