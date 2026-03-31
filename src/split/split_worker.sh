@@ -3,13 +3,20 @@
 # src/split/split_worker.sh — Parallel Part Upload Worker
 #
 # Defines split_upload_worker(), which is spawned in parallel by
-# split_transfer.sh — one process per SPLIT_PART_WORKERS setting.
+# split_transfer.sh and split_upload.sh — one process per
+# SPLIT_PART_WORKERS setting.
+#
+# In split_transfer.sh the queue is fully populated before workers
+# start (static list).  In split_upload.sh the queue is populated
+# concurrently by parallel hash workers — upload workers start
+# immediately and consume parts as hashing completes.  The sentinel
+# value __DONE__ appended to the queue file by the hash collector
+# signals that no more parts will be added.
 #
 # Unlike upload_worker.sh (which consumes a dynamic queue fed by
-# concurrent downloaders), this worker operates on a static ordered
-# list of part files that are all present in staging before any
-# worker is spawned.  The work queue is simply the parts directory
-# listing divided across N workers via atomic pop.
+# concurrent downloaders), this worker operates on part files that
+# land in staging during the hash phase.  The work queue is a shared
+# flat file divided across N workers via atomic pop + flock.
 #
 # Each worker instance:
 #   1. Atomically pops the next part filename from the shared
@@ -33,8 +40,12 @@
 #      delete local part (allows retry on re-run if part still exists).
 #   8. Writes per-worker result file for summary merging.
 #
-# Shared state files (all under TEMP_DIR):
-#   split_part_queue.txt   — one part filename per line; atomically popped
+# Shared state files (all under SPLIT_JOB_DIR):
+#   split_part_queue.txt   — one part filename per line; atomically popped.
+#                            When used with split_upload.sh parallel hashing,
+#                            the special sentinel line __DONE__ is appended
+#                            after all hash workers finish to signal no more
+#                            parts will be added.
 #   split_part_queue.lock  — flock target for queue pop
 #   split_status/          — one file per part: UPLOADED or FAILED
 #
@@ -80,7 +91,23 @@ EOF
         partname=$(cat "${SPLIT_JOB_DIR}/workers/split_ul_worker_${worker_id}.next")
 
         if [[ -z "${partname}" ]]; then
-            log "DEBUG" "Split upload worker ${worker_id} — queue empty, exiting"
+            # Queue is currently empty.  In split_upload.sh parallel-hash mode
+            # the queue is fed incrementally — check whether the hash collector
+            # has finished (sentinel __DONE__ present) before exiting.
+            # In static-queue mode (split_transfer.sh) __DONE__ is never written
+            # so this check always falls through to the exit branch immediately.
+            if grep -qF '__DONE__' "${queue_file}" 2>/dev/null; then
+                log "DEBUG" "Split upload worker ${worker_id} — sentinel seen, exiting"
+                break
+            fi
+            # Hash workers still running — wait briefly and retry
+            sleep 0.25
+            continue
+        fi
+
+        # Sentinel line: treat as end-of-queue signal
+        if [[ "${partname}" == "__DONE__" ]]; then
+            log "DEBUG" "Split upload worker ${worker_id} — popped sentinel, exiting"
             break
         fi
 

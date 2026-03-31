@@ -36,7 +36,8 @@ UPLOAD_CLI_SOURCE_FILE=""     # positional arg 1: local source file path
 UPLOAD_CLI_CONFIG=""          # -c  path to transfer.conf
 UPLOAD_CLI_REMOTE_PATH=""     # -r  remote SFTP subpath override
 UPLOAD_CLI_SIZE=""            # -s  part size override
-UPLOAD_CLI_WORKERS=""         # -p  parallel worker count override
+UPLOAD_CLI_WORKERS=""         # -p  parallel upload worker count override
+UPLOAD_CLI_HASH_WORKERS=""    # -H  parallel hash worker count override
 UPLOAD_CLI_TEMP_DIR=""        # -t  staging directory override
 UPLOAD_CLI_DELETE=false       # -d  delete source file after successful upload
 UPLOAD_CLI_VERBOSE=false      # -v  verbose / DEBUG output
@@ -65,6 +66,9 @@ Optional:
   -s SIZE   Part size (split -b syntax)     (default: 1g)
             Examples: 500m, 2g, 1073741824
   -p N      Parallel SFTP upload workers    (default: 10)
+  -H N      Parallel sha256 hash workers    (default: nproc-1)
+            Hashing and uploading overlap — upload workers start immediately
+            and consume parts from the queue as hashing completes.
   -t DIR    Override staging/temp dir       (this run only)
   -d        Delete source file after successful upload + verification
   -v        Verbose output (DEBUG level)    (stdout + log)
@@ -80,6 +84,7 @@ Examples:
   ${SCRIPT_NAME} /mnt/data/blockchain.tar.xz
   ${SCRIPT_NAME} /mnt/data/blockchain.tar.xz -r /backups/2024
   ${SCRIPT_NAME} /mnt/data/blockchain.tar.xz -s 2g -p 5
+  ${SCRIPT_NAME} /mnt/data/blockchain.tar.xz -s 2g -p 5 -H 7
   ${SCRIPT_NAME} /mnt/data/blockchain.tar.xz -d
   ${SCRIPT_NAME} /mnt/data/blockchain.tar.xz -r /backups -d -v
 EOF
@@ -100,12 +105,13 @@ split_upload_parse_args() {
         split_upload_usage
     fi
 
-    while getopts ":r:c:s:p:t:dvh" opt; do
+    while getopts ":r:c:s:p:H:t:dvh" opt; do
         case "${opt}" in
             r) UPLOAD_CLI_REMOTE_PATH="${OPTARG}" ;;
             c) UPLOAD_CLI_CONFIG="${OPTARG}" ;;
             s) UPLOAD_CLI_SIZE="${OPTARG}" ;;
             p) UPLOAD_CLI_WORKERS="${OPTARG}" ;;
+            H) UPLOAD_CLI_HASH_WORKERS="${OPTARG}" ;;
             t) UPLOAD_CLI_TEMP_DIR="${OPTARG}" ;;
             d) UPLOAD_CLI_DELETE=true ;;
             v) UPLOAD_CLI_VERBOSE=true ;;
@@ -132,6 +138,7 @@ split_upload_parse_args() {
     [[ -n "${UPLOAD_CLI_WORKERS}" ]]       && SPLIT_PART_WORKERS="${UPLOAD_CLI_WORKERS}"
     # shellcheck disable=SC2034
     [[ "${UPLOAD_CLI_VERBOSE}" == true ]]  && CLI_VERBOSE=true || true
-    # UPLOAD_CLI_REMOTE_PATH, UPLOAD_CLI_TEMP_DIR, UPLOAD_CLI_DELETE are read
-    # directly by split_upload_main() in split_upload.sh — not propagated here.
+    # UPLOAD_CLI_REMOTE_PATH, UPLOAD_CLI_TEMP_DIR, UPLOAD_CLI_DELETE,
+    # UPLOAD_CLI_HASH_WORKERS are read directly by split_upload_main() in
+    # split_upload.sh — not propagated here.
 }

@@ -115,6 +115,7 @@ split_upload_print_summary() {
     log "INFO" "  Parts created   : ${part_count}"
     log "INFO" "  Part size       : ${SPLIT_SIZE}"
     log "INFO" "  Upload workers  : ${SPLIT_PART_WORKERS}"
+    log "INFO" "  Hash workers    : ${SPLIT_HASH_WORKERS}"
     log "INFO" "  Uploaded        : ${SPLIT_CNT_UPLOADED}"
     log "INFO" "  Skipped (resume): ${SPLIT_CNT_SKIPPED}"
     log "INFO" "  Failed          : ${SPLIT_CNT_FAILED}"
@@ -126,6 +127,30 @@ split_upload_print_summary() {
 # ============================================================
 # split_upload_main
 # Main entry point for split_upload.sh.
+#
+# Execution flow (full/partial mode):
+#   1.  Parse args + load config
+#   2.  Validate source file
+#   3.  Concurrent sha256 + gnu split
+#   4.  Create SFTP parts directory
+#   5.  Spawn upload workers in the background (consume queue as it fills)
+#   6.  Hash all parts in parallel (feeds queue incrementally)
+#   7.  Append __DONE__ sentinel to queue (inside hash collector)
+#   8.  Sort parts meta file (arrival order → numeric order)
+#   9.  Write manifest (all hashes known + sorted)
+#   10. Upload manifest
+#   11. Wait for upload workers to finish
+#   12. Check for failures
+#   13. Optionally delete source file
+#
+# Execution flow (resume mode — manifest + parts already in staging):
+#   1.  Parse args + load config
+#   2.  Detect resume: manifest exists + parts present
+#   3.  Rebuild static queue from local parts
+#   4.  Create SFTP parts directory
+#   5.  Upload manifest
+#   6.  Upload parts in parallel (static queue — no sentinel needed)
+#   7.  Check for failures
 # ============================================================
 split_upload_main() {
     # ---- Preserve staging on failure so re-runs can resume ----
@@ -143,8 +168,9 @@ split_upload_main() {
     validate_split_config
 
     # ---- Apply CLI overrides ----
-    [[ -n "${UPLOAD_CLI_WORKERS:-}"  ]] && SPLIT_PART_WORKERS="${UPLOAD_CLI_WORKERS}" || true
-    [[ -n "${UPLOAD_CLI_TEMP_DIR:-}" ]] && SPLIT_TEMP_DIR="${UPLOAD_CLI_TEMP_DIR}" || true
+    [[ -n "${UPLOAD_CLI_WORKERS:-}"      ]] && SPLIT_PART_WORKERS="${UPLOAD_CLI_WORKERS}"   || true
+    [[ -n "${UPLOAD_CLI_HASH_WORKERS:-}" ]] && SPLIT_HASH_WORKERS="${UPLOAD_CLI_HASH_WORKERS}" || true
+    [[ -n "${UPLOAD_CLI_TEMP_DIR:-}"     ]] && SPLIT_TEMP_DIR="${UPLOAD_CLI_TEMP_DIR}"     || true
     [[ "${UPLOAD_CLI_VERBOSE:-false}" == true ]] && CLI_VERBOSE=true || true
 
     # ---- Resolve TEMP_DIR ----
@@ -215,7 +241,8 @@ print(n * mult)
     log "INFO" "  Source file   : ${source_file}"
     log "INFO" "  SFTP dest     : ${sftp_base_dir}/"
     log "INFO" "  Part size     : ${SPLIT_SIZE} (${part_size_bytes} bytes)"
-    log "INFO" "  Workers       : ${SPLIT_PART_WORKERS}"
+    log "INFO" "  Upload workers: ${SPLIT_PART_WORKERS}"
+    log "INFO" "  Hash workers  : ${SPLIT_HASH_WORKERS}"
     log "INFO" "  Job dir       : ${SPLIT_JOB_DIR}"
 
     # ---- Resume detection ----
@@ -224,7 +251,9 @@ print(n * mult)
     existing_part_count=$(find "${parts_dir}" -maxdepth 1 -name "${part_prefix}*" 2>/dev/null | wc -l)
 
     if [[ -f "${local_manifest}" ]] && (( existing_part_count > 0 )); then
-        # ---- RESUME MODE ----
+        # ====================================================================
+        # RESUME MODE — manifest + parts already in staging from a prior run
+        # ====================================================================
         log "INFO" "Resuming from existing local staging — skipping split"
         log "INFO" "  Local manifest : ${local_manifest}"
         log "INFO" "  Parts found    : ${existing_part_count}"
@@ -233,7 +262,9 @@ print(n * mult)
         original_sha256="${MANIFEST_ORIGINAL_SHA256}"
         SPLIT_PART_COUNT="${MANIFEST_PART_COUNT}"
 
-        # Rebuild upload queue from parts still present locally
+        # Rebuild static upload queue from parts still present locally.
+        # In resume mode the queue is fully populated before workers start
+        # so no sentinel is needed — workers exit when the queue drains.
         local queue_file="${SPLIT_JOB_DIR}/split_part_queue.txt"
         : > "${queue_file}"
         local queued_count=0
@@ -243,13 +274,25 @@ print(n * mult)
         done < <(find "${parts_dir}" -maxdepth 1 -name "${part_prefix}*" | sort)
         log "INFO" "  Queue rebuilt  : ${queued_count} part(s) remaining to upload"
 
-    else
-        # ---- FULL / PARTIAL MODE ----
-        # In both cases the source file is read in-place from its original path.
+        # ---- Step R1: Create SFTP parts directory ----
+        sftp_mkdir_p "${sftp_parts_dir}"
 
+        # ---- Step R2: Upload manifest ----
+        split_upload_manifest "${local_manifest}" "${sftp_manifest_path}"
+
+        # ---- Step R3: Upload parts in parallel (static queue — no sentinel) ----
+        split_run_upload_workers \
+            "${parts_dir}" \
+            "${sftp_parts_dir}" \
+            "${SPLIT_PART_WORKERS}"
+
+    else
+        # ====================================================================
+        # FULL / PARTIAL MODE — split source file and upload from scratch
+        # ====================================================================
         original_size=$(stat -c '%s' "${source_file}")
 
-        # ---- Step 4: Concurrent sha256 + split ----
+        # ---- Step 4: Concurrent whole-file sha256 + gnu split ----
         split_run_concurrent_hash_and_split \
             "${source_file}" \
             "${parts_dir}" \
@@ -261,13 +304,33 @@ print(n * mult)
         original_sha256=$(awk '{print $1}' "${hash_out_file}")
         log "INFO" "Source file sha256: ${original_sha256}"
 
-        # ---- Step 5: Collect per-part metadata ----
-        split_collect_part_metadata \
+        # ---- Step 5: Create SFTP parts directory ----
+        sftp_mkdir_p "${sftp_parts_dir}"
+
+        # ---- Step 6: Spawn upload workers in the background ----
+        # Workers start immediately and block on an empty queue.  They will
+        # begin uploading as soon as the first hashed parts appear and exit
+        # only after the sentinel __DONE__ is appended (step 7).
+        : > "${SPLIT_JOB_DIR}/split_part_queue.txt"
+        split_start_upload_workers \
+            "${parts_dir}" \
+            "${sftp_parts_dir}" \
+            "${SPLIT_PART_WORKERS}"
+
+        # ---- Step 7: Hash all parts in parallel; feed queue as each completes ----
+        # Appends __DONE__ sentinel to the queue after all workers finish.
+        split_collect_part_metadata_parallel \
             "${parts_dir}" \
             "${part_prefix}" \
-            "${parts_meta_file}"
+            "${parts_meta_file}" \
+            "${SPLIT_HASH_WORKERS}"
 
-        # ---- Step 6: Write manifest ----
+        # ---- Step 8: Sort meta file (parallel hashing produces arrival order) ----
+        # Ensure manifest lists parts in ascending numeric order regardless of
+        # which hash worker finished each part first.
+        sort -t. -k3 -n "${parts_meta_file}" -o "${parts_meta_file}"
+
+        # ---- Step 9: Write manifest (all hashes now known + sorted) ----
         write_manifest \
             "${local_manifest}" \
             "${source_file}" \
@@ -280,23 +343,18 @@ print(n * mult)
             "${sftp_parts_dir}" \
             "${parts_meta_file}"
 
-        # ---- Step 6b: Read manifest into memory ----
+        # ---- Step 9b: Read manifest into memory ----
         read_manifest "${local_manifest}"
+
+        # ---- Step 10: Upload manifest ----
+        split_upload_manifest "${local_manifest}" "${sftp_manifest_path}"
+
+        # ---- Step 11: Wait for upload workers to finish ----
+        split_wait_upload_workers
+
     fi
 
-    # ---- Step 7: Create SFTP parts directory ----
-    sftp_mkdir_p "${sftp_parts_dir}"
-
-    # ---- Step 8: Upload manifest ----
-    split_upload_manifest "${local_manifest}" "${sftp_manifest_path}"
-
-    # ---- Step 9: Upload parts in parallel ----
-    split_run_upload_workers \
-        "${parts_dir}" \
-        "${sftp_parts_dir}" \
-        "${SPLIT_PART_WORKERS}"
-
-    # ---- Step 10: Check for failures ----
+    # ---- Check for failures ----
     if (( SPLIT_CNT_FAILED > 0 || SPLIT_CNT_ERRORS > 0 )); then
         log "ERROR" "Split upload completed with failures — ${SPLIT_CNT_FAILED} failed, ${SPLIT_CNT_ERRORS} errors"
         log "ERROR" "Re-run split_upload.sh with the same arguments to resume"
@@ -306,7 +364,7 @@ print(n * mult)
         exit 1
     fi
 
-    # ---- Step 11: Optionally delete source file ----
+    # ---- Optionally delete source file ----
     if [[ "${UPLOAD_CLI_DELETE:-false}" == "true" ]]; then
         log "INFO" "Deleting source file after successful upload: ${source_file}"
         rm -f "${source_file}"

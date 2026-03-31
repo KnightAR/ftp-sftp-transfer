@@ -43,6 +43,12 @@
 #                         Default: 4.
 #   SPLIT_RESTORE_RETRY_SLEEP — seconds to wait between restore download retry
 #                         attempts.  Default: 10.
+#   SPLIT_HASH_WORKERS  — number of parallel sha256 hash workers used during
+#                         the per-part metadata collection phase in
+#                         split_upload.sh.  Defaults to nproc-1 (at least 1).
+#                         Has no effect on split_transfer.sh or
+#                         split_restore.sh (those use sequential hashing).
+#                         Can be overridden via -H on the split_upload.sh CLI.
 #   SPLIT_TEMP_DIR      — required base temp directory for split_transfer.sh
 #                         and split_restore.sh.  Must be set in transfer.conf
 #                         or via -t on the CLI.  Unlike transfer.sh, split
@@ -80,6 +86,12 @@ apply_split_defaults() {
     # Retry attempts + sleep for failed restore part downloads
     : "${SPLIT_RESTORE_RETRIES:=4}"
     : "${SPLIT_RESTORE_RETRY_SLEEP:=10}"
+
+    # Parallel sha256 hash workers for per-part metadata collection (split_upload.sh only).
+    # Defaults to nproc-1, clamped to at least 1.
+    local _default_hash_workers=$(( $(nproc 2>/dev/null || echo 2) - 1 ))
+    (( _default_hash_workers < 1 )) && _default_hash_workers=1
+    : "${SPLIT_HASH_WORKERS:=${_default_hash_workers}}"
 
     # Static temp directory for split scripts — no mktemp fallback.
     # Required for resume: staging must survive a failed run.
@@ -137,6 +149,12 @@ validate_split_config() {
     # Validate SPLIT_RESTORE_WORKERS — must be a positive integer
     if ! [[ "${SPLIT_RESTORE_WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
         echo "ERROR: SPLIT_RESTORE_WORKERS must be a positive integer (got: '${SPLIT_RESTORE_WORKERS}')" >&2
+        (( errors++ )) || true
+    fi
+
+    # Validate SPLIT_HASH_WORKERS — must be a positive integer
+    if ! [[ "${SPLIT_HASH_WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: SPLIT_HASH_WORKERS must be a positive integer (got: '${SPLIT_HASH_WORKERS}')" >&2
         (( errors++ )) || true
     fi
 
