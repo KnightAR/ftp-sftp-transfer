@@ -115,17 +115,34 @@ EOF
         local sftp_dest="${sftp_parts_dir}/${partname}"
         local status_file="${SPLIT_JOB_DIR}/split_status/${partname}"
 
+        # ---- Resolve expected size + hash for this part ----
+        # In parallel-hash mode (split_upload.sh full/partial flow) the manifest
+        # is not yet written when upload workers start.  Each hash worker writes a
+        # sidecar file: ${SPLIT_JOB_DIR}/part_hashes/<partname>.sha256
+        # containing "<hex>  <size>" so upload workers can validate immediately.
+        # In resume mode (and split_transfer.sh) the sidecar does not exist but
+        # the manifest is already loaded into memory — fall back to manifest lookups.
+        local _sidecar="${SPLIT_JOB_DIR}/part_hashes/${partname}.sha256"
+        local expected_size expected_hash
+        if [[ -f "${_sidecar}" ]]; then
+            expected_hash=$(awk '{print $1}' "${_sidecar}")
+            expected_size=$(awk '{print $2}' "${_sidecar}")
+        else
+            expected_size=$(get_manifest_part_size "${partname}")
+            expected_hash=$(get_manifest_part_hash "${partname}")
+        fi
+        # Final fallback: stat the local file (always present at upload time)
+        if [[ -z "${expected_size}" ]] && [[ -f "${local_part}" ]]; then
+            expected_size=$(stat -c '%s' "${local_part}" 2>/dev/null || echo "")
+        fi
+
         # ---- Check if already uploaded on a previous run (resume support) ----
         local existing_size
         existing_size=$(sftp_get_size "${sftp_dest}")
-        local expected_size
-        expected_size=$(get_manifest_part_size "${partname}")
 
-        if [[ "${existing_size}" == "${expected_size}" ]]; then
+        if [[ -n "${expected_size}" ]] && [[ "${existing_size}" == "${expected_size}" ]]; then
             # Part already exists on SFTP with correct size — verify hash then skip upload
             log "DEBUG" "[SUL${worker_id}] Part already on SFTP with correct size — verifying hash: ${partname}"
-            local expected_hash
-            expected_hash=$(get_manifest_part_hash "${partname}")
             local verify_file="${local_part}.verify"
             local part_ok=false
 
@@ -200,8 +217,8 @@ EOF
         # when all 10 upload workers try to pull 1 GiB each at the same time.
         # Upload and queue-pop remain fully parallel — only the verify step is
         # throttled.
-        local expected_hash
-        expected_hash=$(get_manifest_part_hash "${partname}")
+        # expected_hash was already resolved from sidecar or manifest at the
+        # top of this loop iteration — no re-lookup needed here.
         local verify_file="${local_part}.verify"
         local verify_slots="${SPLIT_VERIFY_SLOTS:-3}"
         local slot_acquired=false

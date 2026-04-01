@@ -221,6 +221,15 @@ split_collect_part_metadata_parallel() {
             _part_size=$(stat -c '%s' "${_partfile}" 2>/dev/null || echo 0)
             _part_hash=$(sha256sum "${_partfile}" 2>/dev/null | awk '{print $1}')
 
+            # Write per-part hash sidecar so upload workers can verify without
+            # waiting for the manifest to be written.
+            # File: ${SPLIT_JOB_DIR}/part_hashes/<partname>.sha256
+            # Format: <hex>  <size>
+            local _sidecar_dir="${SPLIT_JOB_DIR}/part_hashes"
+            mkdir -p "${_sidecar_dir}"
+            printf '%s  %s\n' "${_part_hash}" "${_part_size}" \
+                > "${_sidecar_dir}/${_partname}.sha256"
+
             # Append to meta file (flock — arrival order, caller sorts later)
             (
                 flock -x 201
