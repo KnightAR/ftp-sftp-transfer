@@ -263,8 +263,10 @@ split_collect_part_metadata_parallel() {
             "${meta_lock}" \
             "${queue_file}" \
             "${queue_lock}" &
-        hash_pids+=($!)
-        log "DEBUG" "Hash worker ${i} PID=${hash_pids[-1]}"
+        local _hpid=$!
+        hash_pids+=("${_hpid}")
+        WORKER_PIDS+=("${_hpid}")   # register with trap so Ctrl+C kills them
+        log "DEBUG" "Hash worker ${i} PID=${_hpid}"
     done
 
     # Wait for all hash workers; propagate any failure
@@ -384,8 +386,10 @@ split_start_upload_workers() {
     local i
     for (( i=1; i<=num_workers; i++ )); do
         split_upload_worker "${i}" "${parts_staging_dir}" "${sftp_parts_dir}" &
-        _SPLIT_UPLOAD_WORKER_PIDS+=($!)
-        log "DEBUG" "  Upload worker ${i} PID=${_SPLIT_UPLOAD_WORKER_PIDS[-1]}"
+        local _pid=$!
+        _SPLIT_UPLOAD_WORKER_PIDS+=("${_pid}")
+        WORKER_PIDS+=("${_pid}")   # register with trap so Ctrl+C kills them
+        log "DEBUG" "  Upload worker ${i} PID=${_pid}"
     done
 }
 
