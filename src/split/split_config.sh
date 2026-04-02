@@ -37,6 +37,16 @@
 #                         Default: 4.
 #   SPLIT_VERIFY_RETRY_SLEEP  — seconds to wait between verify retry attempts.
 #                         Default: 10.
+#   SPLIT_UPLOAD_RETRIES      — number of times to retry a failed sftp put
+#                         before marking the part as an error.  Each attempt
+#                         re-uploads the full part from scratch.  Default: 3.
+#   SPLIT_UPLOAD_RETRY_SLEEP  — seconds to wait between upload retry attempts.
+#                         Default: 15.
+#   SPLIT_SFTP_TIMEOUT        — wall-clock timeout in seconds applied to each
+#                         individual sftp call via the \`timeout\` command.
+#                         Protects against hung connections on object-storage
+#                         backends (e.g. OVH PCA) that do not honour SSH
+#                         keepalives.  Set to 0 to disable.  Default: 3600.
 #   SPLIT_RESTORE_RETRIES     — number of times to retry a failed restore part
 #                         download before marking it as an error.  Handles
 #                         transient SFTP connection failures or empty listings.
@@ -82,6 +92,21 @@ apply_split_defaults() {
     # Retry attempts + sleep for failed verify re-downloads
     : "${SPLIT_VERIFY_RETRIES:=4}"
     : "${SPLIT_VERIFY_RETRY_SLEEP:=10}"
+
+    # Retry attempts + sleep for failed part uploads (sftp put).
+    # Each attempt re-uploads the full part from scratch.
+    # Default: 3 attempts, 15s between retries.
+    : "${SPLIT_UPLOAD_RETRIES:=3}"
+    : "${SPLIT_UPLOAD_RETRY_SLEEP:=15}"
+
+    # Wall-clock timeout (seconds) applied to each individual sftp call
+    # via the \`timeout\` command.  Protects against hung connections on
+    # object-storage backends that do not honour SSH keepalives.
+    # Upload timeout should be generous enough for the largest part size
+    # over your uplink.  Verify timeout covers a full re-download.
+    # Set to 0 to disable (not recommended).
+    # Default: 3600s (1 hour) — covers a 1 GiB part on a slow link.
+    : "${SPLIT_SFTP_TIMEOUT:=3600}"
 
     # Retry attempts + sleep for failed restore part downloads
     : "${SPLIT_RESTORE_RETRIES:=4}"

@@ -22,7 +22,7 @@
 #   1. Atomically pops the next part filename from the shared
 #      part queue file (TEMP_DIR/split_part_queue.txt).
 #   2. Constructs the full local path and SFTP destination path.
-#   3. Uploads via sshpass sftp put.
+#   3. Uploads via sshpass sftp put (with timeout + retry).
 #   4. Verifies post-upload size via sftp_get_size_retry() —
 #      handles object-storage commit lag.
 #   5. Re-downloads the part to a .verify temp file and compares
@@ -39,6 +39,13 @@
 #   7. On verify FAIL — logs error, marks part as FAILED, does NOT
 #      delete local part (allows retry on re-run if part still exists).
 #   8. Writes per-worker result file for summary merging.
+#
+# Upload retry:
+#   sftp put is retried up to SPLIT_UPLOAD_RETRIES times (default 3)
+#   with SPLIT_UPLOAD_RETRY_SLEEP seconds between attempts.
+#   Each attempt is wrapped with `timeout SPLIT_SFTP_TIMEOUT` to
+#   prevent indefinite hangs on object-storage backends that do not
+#   honour SSH keepalives.
 #
 # Shared state files (all under SPLIT_JOB_DIR):
 #   split_part_queue.txt   — one part filename per line; atomically popped.
@@ -57,6 +64,22 @@
 #   get_manifest_part_size).
 # ============================================================
 
+# _split_sftp_run [timeout_secs] sftp_args...
+#
+# Runs sftp via sshpass, optionally wrapping with `timeout`.
+# If timeout_secs is 0 or empty, no timeout is applied.
+# Returns the sftp exit code.
+_split_sftp_run() {
+    local _timeout="${1}"; shift
+    if [[ -n "${_timeout}" ]] && (( _timeout > 0 )); then
+        SSHPASS="${SFTP_PASS}" sshpass -e \
+            timeout "${_timeout}" \
+            sftp "$@"
+    else
+        SSHPASS="${SFTP_PASS}" sshpass -e sftp "$@"
+    fi
+}
+
 # split_upload_worker WORKER_ID PARTS_STAGING_DIR SFTP_PARTS_DIR
 split_upload_worker() {
     local worker_id="$1"
@@ -65,6 +88,12 @@ split_upload_worker() {
     local result_file="${SPLIT_JOB_DIR}/workers/split_ul_worker_${worker_id}.result"
     local queue_file="${SPLIT_JOB_DIR}/split_part_queue.txt"
     local lock_file="${SPLIT_JOB_DIR}/split_part_queue.lock"
+
+    # Resolve config vars with defaults (workers run as subshells —
+    # apply_split_defaults may not have been called in this process)
+    local upload_retries="${SPLIT_UPLOAD_RETRIES:-3}"
+    local upload_retry_sleep="${SPLIT_UPLOAD_RETRY_SLEEP:-15}"
+    local sftp_timeout="${SPLIT_SFTP_TIMEOUT:-3600}"
 
     cat > "${result_file}" <<EOF
 UPLOADED=0
@@ -146,7 +175,7 @@ EOF
             local verify_file="${local_part}.verify"
             local part_ok=false
 
-            if SSHPASS="${SFTP_PASS}" sshpass -e sftp \
+            if _split_sftp_run "${sftp_timeout}" \
                     -P "${SFTP_PORT}" \
                     -o StrictHostKeyChecking=no \
                     -o BatchMode=no \
@@ -177,20 +206,37 @@ EOF
             log "WARN" "[SUL${worker_id}] Existing SFTP part hash mismatch — re-uploading: ${partname}"
         fi
 
-        # ---- Upload the part ----
-        log "INFO" "[SUL${worker_id}] Uploading part: ${partname} → ${sftp_dest}"
+        # ---- Upload the part (with retry) ----
+        local upload_attempt=1
+        local upload_ok=false
 
-        if ! SSHPASS="${SFTP_PASS}" sshpass -e sftp \
-                -P "${SFTP_PORT}" \
-                -o StrictHostKeyChecking=no \
-                -o BatchMode=no \
-                -o ConnectTimeout=5 \
-                -o ServerAliveInterval=15 \
-                -o ServerAliveCountMax=3 \
-                -o LogLevel=ERROR \
-                -b <(printf 'put %s %s\n' "${local_part}" "${sftp_dest}") \
-                "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
-            log "ERROR" "[SUL${worker_id}] SFTP upload failed: ${partname}"
+        while (( upload_attempt <= upload_retries )); do
+            log "INFO" "[SUL${worker_id}] Uploading part (attempt ${upload_attempt}/${upload_retries}): ${partname} → ${sftp_dest}"
+
+            if _split_sftp_run "${sftp_timeout}" \
+                    -P "${SFTP_PORT}" \
+                    -o StrictHostKeyChecking=no \
+                    -o BatchMode=no \
+                    -o ConnectTimeout=5 \
+                    -o ServerAliveInterval=15 \
+                    -o ServerAliveCountMax=3 \
+                    -o LogLevel=ERROR \
+                    -b <(printf 'put %s %s\n' "${local_part}" "${sftp_dest}") \
+                    "${SFTP_USER}@${SFTP_HOST}" &>/dev/null; then
+                upload_ok=true
+                break
+            fi
+
+            log "WARN" "[SUL${worker_id}] SFTP upload failed (attempt ${upload_attempt}/${upload_retries}): ${partname}"
+            if (( upload_attempt < upload_retries )); then
+                log "INFO" "[SUL${worker_id}] Retrying upload in ${upload_retry_sleep}s: ${partname}"
+                sleep "${upload_retry_sleep}"
+            fi
+            (( upload_attempt++ )) || true
+        done
+
+        if [[ "${upload_ok}" != true ]]; then
+            log "ERROR" "[SUL${worker_id}] SFTP upload failed after ${upload_retries} attempt(s): ${partname}"
             echo "FAILED" > "${status_file}"
             _inc_result "${result_file}" "ERRORS"
             continue
@@ -225,15 +271,16 @@ EOF
         local slot_fd slot_num
 
         # Try each slot in round-robin until we acquire one
-        # shellcheck disable=SC2034
         for slot_num in $(seq 1 "${verify_slots}"); do
             local slot_lock="${SPLIT_JOB_DIR}/split_verify_slot_${slot_num}.lock"
-            # Non-blocking trylock — move to next slot if busy
-            if exec {slot_fd}>"${slot_lock}" && flock -n "${slot_fd}"; then
+            # Non-blocking trylock — move to next slot if busy.
+            # Open fd first, then attempt lock; close fd if lock fails.
+            exec {slot_fd}>"${slot_lock}"
+            if flock -n "${slot_fd}"; then
                 slot_acquired=true
                 break
             fi
-            exec {slot_fd}>&- 2>/dev/null || true
+            exec {slot_fd}>&-
         done
 
         # If all slots busy, fall back to blocking wait on slot 1
@@ -257,7 +304,7 @@ EOF
         # effect — releasing between attempts would allow immediate re-flooding.
         while (( verify_attempt <= verify_max )); do
             actual_hash=""
-            if SSHPASS="${SFTP_PASS}" sshpass -e sftp \
+            if _split_sftp_run "${sftp_timeout}" \
                     -P "${SFTP_PORT}" \
                     -o StrictHostKeyChecking=no \
                     -o BatchMode=no \
@@ -297,7 +344,7 @@ EOF
         if [[ "${actual_hash}" != "${expected_hash}" ]]; then
             log "ERROR" "[SUL${worker_id}] Part hash mismatch (manifest=${expected_hash}, sftp=${actual_hash}): ${partname}"
             # Delete the corrupt SFTP part so a re-run re-uploads it cleanly
-            SSHPASS="${SFTP_PASS}" sshpass -e sftp \
+            _split_sftp_run "${sftp_timeout}" \
                 -P "${SFTP_PORT}" \
                 -o StrictHostKeyChecking=no \
                 -o BatchMode=no \
