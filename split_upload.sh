@@ -318,12 +318,14 @@ print(n * mult)
             "${SPLIT_PART_WORKERS}"
 
         # ---- Step 7: Hash all parts in parallel; feed queue as each completes ----
-        # Appends __DONE__ sentinel to the queue after all workers finish.
+        # Appends one __DONE__ sentinel per upload worker after all hashing
+        # finishes, so every upload worker pops exactly one sentinel and exits.
         split_collect_part_metadata_parallel \
             "${parts_dir}" \
             "${part_prefix}" \
             "${parts_meta_file}" \
-            "${SPLIT_HASH_WORKERS}"
+            "${SPLIT_HASH_WORKERS}" \
+            "${SPLIT_PART_WORKERS}"
 
         # ---- Step 8: Sort meta file (parallel hashing produces arrival order) ----
         # Ensure manifest lists parts in ascending numeric order regardless of

@@ -124,7 +124,7 @@ split_collect_part_metadata() {
 
 # ============================================================
 # split_collect_part_metadata_parallel PARTS_DIR PART_PREFIX PARTS_META_FILE
-#                                       HASH_WORKERS
+#                                       HASH_WORKERS NUM_UPLOAD_WORKERS
 #
 # Parallel version of split_collect_part_metadata() for use by
 # split_upload.sh.  Spawns HASH_WORKERS background processes that
@@ -134,9 +134,10 @@ split_collect_part_metadata() {
 # before this function was called can begin uploading immediately
 # rather than waiting for all hashing to complete.
 #
-# After all hash workers finish, appends the sentinel __DONE__ to
-# split_part_queue.txt so waiting upload workers know no more parts
-# will be added.
+# After all hash workers finish, appends NUM_UPLOAD_WORKERS copies of
+# the sentinel __DONE__ to split_part_queue.txt — one per upload worker
+# — so every worker is guaranteed to pop exactly one sentinel and exit
+# cleanly even if another worker already consumed an earlier sentinel.
 #
 # Sets SPLIT_PART_COUNT.
 # Does NOT sort parts_meta_file — caller must sort before write_manifest().
@@ -146,6 +147,7 @@ split_collect_part_metadata_parallel() {
     local part_prefix="$2"
     local parts_meta_file="$3"
     local hash_workers="$4"
+    local num_upload_workers="${5:-1}"
     local queue_file="${SPLIT_JOB_DIR}/split_part_queue.txt"
     local queue_lock="${SPLIT_JOB_DIR}/split_part_queue.lock"
 
@@ -281,13 +283,19 @@ split_collect_part_metadata_parallel() {
 
     log "INFO" "Parallel hashing complete — ${SPLIT_PART_COUNT} parts hashed"
 
-    # Append sentinel so upload workers know no more parts are coming
+    # Append one __DONE__ sentinel per upload worker so every worker is
+    # guaranteed to pop exactly one and exit cleanly.  A single sentinel
+    # would be consumed by one worker while the rest spin forever on an
+    # empty queue.
     (
         flock -x 200
-        echo "__DONE__" >> "${queue_file}"
+        local _s
+        for (( _s=1; _s<=num_upload_workers; _s++ )); do
+            echo "__DONE__" >> "${queue_file}"
+        done
     ) 200>"${queue_lock}"
 
-    log "DEBUG" "Sentinel __DONE__ written to queue"
+    log "DEBUG" "Sentinel __DONE__ x${num_upload_workers} written to queue"
 }
 
 # ============================================================

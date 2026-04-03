@@ -120,16 +120,10 @@ EOF
         partname=$(cat "${SPLIT_JOB_DIR}/workers/split_ul_worker_${worker_id}.next")
 
         if [[ -z "${partname}" ]]; then
-            # Queue is currently empty.  In split_upload.sh parallel-hash mode
-            # the queue is fed incrementally — check whether the hash collector
-            # has finished (sentinel __DONE__ present) before exiting.
-            # In static-queue mode (split_transfer.sh) __DONE__ is never written
-            # so this check always falls through to the exit branch immediately.
-            if grep -qF '__DONE__' "${queue_file}" 2>/dev/null; then
-                log "DEBUG" "Split upload worker ${worker_id} — sentinel seen, exiting"
-                break
-            fi
-            # Hash workers still running — wait briefly and retry
+            # Queue is currently empty — hash workers are still running.
+            # Wait briefly and retry.  Each upload worker will eventually
+            # pop its own __DONE__ sentinel (one is written per worker by
+            # split_collect_part_metadata_parallel after all hashing finishes).
             sleep 0.25
             continue
         fi
