@@ -57,6 +57,13 @@
 #   REPACK_REMOTE_DIR       (overrides SFTP_REMOTE_DIR for repack uploads)
 #   REPACK_PBZIP2_BLOCK     (default: 100)
 #   REPACK_PBZIP2_MEMORY    (default: 2000)
+#   REPACK_IGNORE_PATTERNS  (bash array; merged with -i CLI flags at startup)
+#                           Example in transfer.conf:
+#                             REPACK_IGNORE_PATTERNS=(
+#                               'slim/*'
+#                               'slim/**'
+#                               'tmp/broken.sql'
+#                             )
 #
 # Lock file:  <output_dir>/repack_zpaq.sh.lock
 # Log file:   <output_dir>/logs/repack_<timestamp>.log
@@ -96,6 +103,7 @@ CLI_PBZIP2_BLOCK=0
 CLI_PBZIP2_MEMORY=0
 CLI_DRY_RUN=false
 CLI_VERBOSE=false
+CLI_IGNORE_PATTERNS=()   # -i PATTERN  (repeatable)
 
 # Positional arguments
 ARG_ARCHIVES=()
@@ -133,6 +141,7 @@ REPACK_VERIFY_DIR=""
 
 # Stats
 STAT_TOTAL=0
+STAT_IGNORED=0
 STAT_SKIPPED_REMOTE=0
 STAT_SKIPPED_LOCAL=0
 STAT_ENQUEUED_EXTRACT=0
@@ -158,13 +167,22 @@ Options:
   -r DIR      Remote SFTP base directory override   (default: SFTP_REMOTE_DIR)
   -b N        pbzip2 block size in 100KB steps      (default: 100 = 10MB)
   -m N        pbzip2 memory limit in MB             (default: 2000)
+  -i PATTERN  Ignore files matching PATTERN inside archives (repeatable).
+              PATTERN is matched against the internal archive path (no leading /).
+              Use * for single-level wildcard:   -i 'slim/*'
+              Use ** for recursive wildcard:     -i 'slim/**'
+              Exact path also works:             -i 'slim/broken.sql'
+              Leading / is stripped automatically so /slim/* == slim/*.
+              Applies to all archives. Can also be set via REPACK_IGNORE_PATTERNS
+              array in transfer.conf for persistent ignore lists.
   -dry-run    Show what would happen; make no changes
   -v          Verbose / DEBUG output
   -h          Show this help and exit
 
 Config: SFTP_HOST, SFTP_PORT, SFTP_USER, SFTP_PASS, SFTP_REMOTE_DIR,
         ZPAQ_TEMP_DIR, REPACK_OUTPUT_DIR, REPACK_REMOTE_DIR,
-        REPACK_PBZIP2_BLOCK, REPACK_PBZIP2_MEMORY
+        REPACK_PBZIP2_BLOCK, REPACK_PBZIP2_MEMORY,
+        REPACK_IGNORE_PATTERNS (bash array of ignore patterns)
 EOF
 }
 
@@ -181,6 +199,7 @@ parse_args() {
             -r)         CLI_REMOTE_DIR="$2";     shift 2 ;;
             -b)         CLI_PBZIP2_BLOCK="$2";   shift 2 ;;
             -m)         CLI_PBZIP2_MEMORY="$2";  shift 2 ;;
+            -i)         CLI_IGNORE_PATTERNS+=("$2"); shift 2 ;;
             -dry-run)   CLI_DRY_RUN=true;        shift   ;;
             -v)         CLI_VERBOSE=true;         shift   ;;
             -h|--help)  usage; exit 0            ;;
@@ -265,6 +284,15 @@ load_repack_config() {
         PBZIP2_MEMORY="${CLI_PBZIP2_MEMORY}"
     else
         PBZIP2_MEMORY="${REPACK_PBZIP2_MEMORY}"
+    fi
+
+    # Ignore patterns: merge config-file array with CLI -i flags.
+    # REPACK_IGNORE_PATTERNS may have been set by the sourced config file.
+    # CLI_IGNORE_PATTERNS is populated by -i arguments.
+    # Result: config patterns come first, CLI patterns appended after.
+    # The combined array is used by is_ignored() at runtime.
+    if [[ -v REPACK_IGNORE_PATTERNS ]] && (( ${#REPACK_IGNORE_PATTERNS[@]} > 0 )); then
+        CLI_IGNORE_PATTERNS=( "${REPACK_IGNORE_PATTERNS[@]}" "${CLI_IGNORE_PATTERNS[@]}" )
     fi
 }
 
@@ -532,6 +560,88 @@ report_failures() {
 }
 
 # ============================================================
+# is_ignored — test whether an internal archive path matches any
+# entry in CLI_IGNORE_PATTERNS.
+#
+# Matching rules (applied against the normalised path with no leading /):
+#   *   single-level wildcard — matches any characters except /
+#       e.g.  slim/*  matches slim/foo.sql but NOT slim/sub/foo.sql
+#   **  recursive wildcard  — matches any characters including /
+#       e.g.  slim/**  matches slim/a, slim/a/b, slim/a/b/c, …
+#   Exact strings without wildcards are compared literally.
+#   A leading / in the pattern is stripped before matching so that
+#   patterns written as /slim/* and slim/* are equivalent.
+#
+# Usage:
+#   is_ignored "<internal_path>"   →  returns 0 (true) if ignored
+#                                      returns 1 (false) if not ignored
+# ============================================================
+is_ignored() {
+    local path="$1"
+
+    # Normalise: strip leading slash from the path being tested
+    local norm_path="${path#/}"
+
+    # No patterns → nothing is ignored
+    (( ${#CLI_IGNORE_PATTERNS[@]} == 0 )) && return 1
+
+    local raw_pattern pattern
+    for raw_pattern in "${CLI_IGNORE_PATTERNS[@]}"; do
+        # Normalise pattern: strip leading slash
+        pattern="${raw_pattern#/}"
+
+        # Determine matching strategy based on whether ** appears
+        if [[ "${pattern}" == *'**'* ]]; then
+            # Recursive match: replace ** with a bash glob that
+            # matches any sequence of characters (including /).
+            # We use [[ path == glob ]] with globstar semantics by
+            # converting ** → * (bash [[ == ]] treats * as "any chars"
+            # when not restricted by the single-level rule below).
+            local glob_pattern="${pattern//'**'/'*'}"
+            # shellcheck disable=SC2254
+            if [[ "${norm_path}" == ${glob_pattern} ]]; then
+                return 0
+            fi
+            # Edge case: **/foo patterns like "**/broken.sql" should also
+            # match a top-level "broken.sql" (zero directory components).
+            # After substitution "**/foo" → "*/foo"; that won't match "foo"
+            # because * requires at least one character before /.
+            # Fix: if the collapsed pattern starts with "*/" also try
+            # matching without that leading "*/" prefix.
+            if [[ "${glob_pattern}" == '*/'* ]]; then
+                local trimmed_glob="${glob_pattern#\*/}"
+                # shellcheck disable=SC2254
+                if [[ "${norm_path}" == ${trimmed_glob} ]]; then
+                    return 0
+                fi
+            fi
+        elif [[ "${pattern}" == *'*'* ]]; then
+            # Single-level match: * must not cross a / boundary.
+            # Strategy: split on * and verify each segment does not
+            # contain / in the wildcard positions.
+            #
+            # We build a regex equivalent of the single-level glob:
+            #   replace * with [^/]* in an anchored ERE
+            local regex_pattern
+            # Escape regex metacharacters except * which we handle specially
+            regex_pattern="${pattern//./\\.}"
+            regex_pattern="${regex_pattern//\*/[^/]*}"
+            # Anchor: full string match
+            if [[ "${norm_path}" =~ ^${regex_pattern}$ ]]; then
+                return 0
+            fi
+        else
+            # Exact match
+            if [[ "${norm_path}" == "${pattern}" ]]; then
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
+# ============================================================
 # Process one file: skip checks, then enqueue to extract (or upload)
 # ============================================================
 process_one_file() {
@@ -540,6 +650,19 @@ process_one_file() {
     local uncompressed_size="$3"
 
     (( STAT_TOTAL++ )) || true
+
+    # ------------------------------------------------------------------
+    # Ignore check: test path against CLI_IGNORE_PATTERNS before anything else
+    # ------------------------------------------------------------------
+    if is_ignored "${internal_path}"; then
+        if [[ "${CLI_DRY_RUN}" == true ]]; then
+            log "INFO" "  DRY-RUN: would ignore ${internal_path}"
+        else
+            log "INFO" "  IGNORED: ${internal_path}"
+        fi
+        (( STAT_IGNORED++ )) || true
+        return 0
+    fi
 
     local local_bz2_path="${REPACK_OUTPUT_DIR}/${internal_path}.bz2"
     local local_sha256_path="${local_bz2_path}.sha256"
@@ -617,6 +740,17 @@ main() {
     log "INFO" "archives=${#ARG_ARCHIVES[@]} output=${REPACK_OUTPUT_DIR} remote=${REPACK_REMOTE_DIR_RESOLVED}"
     log "INFO" "pbzip2: block=${PBZIP2_BLOCK}00KB memory=${PBZIP2_MEMORY}MB level=-9"
     log "INFO" "dry-run=${CLI_DRY_RUN}"
+
+    # Log active ignore patterns (if any)
+    if (( ${#CLI_IGNORE_PATTERNS[@]} > 0 )); then
+        log "INFO" "ignore patterns (${#CLI_IGNORE_PATTERNS[@]}):"
+        local _ip
+        for _ip in "${CLI_IGNORE_PATTERNS[@]}"; do
+            log "INFO" "  ignore: ${_ip}"
+        done
+    else
+        log "DEBUG" "ignore patterns: none"
+    fi
 
     validate_repack_config
     setup_temp_dirs
@@ -732,6 +866,7 @@ main() {
     # ------------------------------------------------------------------
     log "INFO" "===== ${SCRIPT_NAME} summary ====="
     log "INFO" "  Total files seen:           ${STAT_TOTAL}"
+    log "INFO" "  Ignored (pattern match):    ${STAT_IGNORED}"
     log "INFO" "  Skipped (remote exists):    ${STAT_SKIPPED_REMOTE}"
     log "INFO" "  Skipped (local .bz2):       ${STAT_SKIPPED_LOCAL}"
     log "INFO" "  Enqueued for extract:       ${STAT_ENQUEUED_EXTRACT}"
