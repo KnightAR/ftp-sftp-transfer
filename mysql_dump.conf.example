@@ -1,0 +1,199 @@
+# ============================================================
+# mysql_dump.conf — MySQL Dump zpaq Configuration
+#
+# Copy to mysql_dump.conf and set chmod 600.
+# All variables can also be set as environment variables,
+# which takes precedence over this file (recommended for Docker).
+#
+# IMPORTANT: Run "chmod 600 mysql_dump.conf" to protect credentials.
+# ============================================================
+
+# ============================================================
+# MySQL Connection
+# ============================================================
+
+# MySQL server hostname or IP address.
+# In Docker Compose, use the service name (e.g. "mysql" or "db").
+MYSQL_HOST="127.0.0.1"
+
+# MySQL port (default: 3306)
+MYSQL_PORT="3306"
+
+# MySQL user with SELECT, SHOW DATABASES, LOCK TABLES, SHOW VIEW,
+# EVENT, TRIGGER, and RELOAD privileges.
+# Recommended: create a dedicated backup user:
+#   CREATE USER 'backup'@'%' IDENTIFIED BY 'strongpassword';
+#   GRANT SELECT, SHOW DATABASES, LOCK TABLES, SHOW VIEW,
+#         EVENT, TRIGGER, RELOAD, PROCESS ON *.* TO 'backup'@'%';
+MYSQL_USER="backup"
+MYSQL_PASS=""
+
+# Explicit list of databases to back up.
+# Leave empty (default) to back up ALL databases minus MYSQL_IGNORE_DATABASES.
+# Example: MYSQL_DATABASES=("myapp" "analytics" "reporting")
+MYSQL_DATABASES=()
+
+# Databases to exclude from automatic discovery.
+# Only applies when MYSQL_DATABASES is empty.
+# Default covers standard MySQL system databases.
+MYSQL_IGNORE_DATABASES=(information_schema mysql performance_schema sys)
+
+# Whether to dump user grants and privileges as a separate backup.
+# The grants file is treated identically to a database backup:
+# xz-compressed to S3 and added to the zpaq archive.
+# Stored as: _grants/_grants_YYYYMMDD_HHMM.sql
+DUMP_GRANTS="true"
+
+# ============================================================
+# S3 / MinIO (mc) Configuration
+# ============================================================
+
+# mc alias name to use/create.
+# The alias is created automatically at startup if it doesn't exist.
+MC_ALIAS="ovh"
+
+# S3-compatible endpoint URL.
+# OVH Object Storage example: https://s3.bhs.io.cloud.ovh.net
+# MinIO example: https://minio.example.com
+S3_ENDPOINT=""
+
+# S3 credentials
+S3_ACCESS_KEY=""
+S3_SECRET_KEY=""
+
+# S3 bucket name (must already exist)
+S3_BUCKET=""
+
+# Set to any non-empty value to pass --insecure to mc alias set.
+# Required for OVH Object Storage and some self-signed MinIO setups.
+# Example: S3_INSECURE="1"
+S3_INSECURE=""
+
+# S3 key prefix for MySQL xz dumps.
+# Final path: s3://BUCKET/S3_MYSQL_PREFIX/<db>/<db>_YYYYMMDD_HHMM.sql.xz
+S3_MYSQL_PREFIX="mysql"
+
+# S3 key prefix for zpaq archive parts.
+# Final path: s3://BUCKET/S3_ZPAQ_PREFIX/<hostname>0000001.zpaq
+S3_ZPAQ_PREFIX="zpaq"
+
+# ============================================================
+# zpaqfranz Archive
+# ============================================================
+
+# Local directory where .zpaq parts are stored permanently.
+# IMPORTANT: These files must NEVER be deleted — every part is
+# required to read the archive. Plan for long-term storage here
+# (dedicated ZFS dataset without compression, NFS, or JuiceFS).
+# Parts are also uploaded to S3 as a second copy.
+ZPAQ_LOCAL_DIR="/data/zpaq"
+
+# zpaqfranz compression method.
+# WARNING: This cannot be changed after the first add. All future
+# adds must use the same method as the archive was created with.
+# Method 5 is recommended for maximum long-term compression.
+# Lower methods (1-2) use less CPU/RAM but produce larger archives.
+ZPAQ_METHOD="5"
+
+# zpaqfranz fragment size (deduplication block size, in KB × 2^N).
+# Default 3 = 8KB blocks. Do not change after first add.
+ZPAQ_FRAGMENT="3"
+
+# Number of ? characters in the multipart archive filename pattern.
+# 7 supports up to 9,999,999 parts. Do not change after first add.
+ZPAQ_MULTIPART_QUESTION_MARKS="7"
+
+# Archive basename — the Docker host's identity.
+# Defaults to $(hostname -s) if not set.
+# In Docker, set this explicitly via environment variable or here.
+# Example: BACKUP_HOSTNAME="db-prod-01"
+BACKUP_HOSTNAME=""
+
+# ============================================================
+# Dump Working Directory
+# ============================================================
+
+# Root directory for temporary raw .sql dump files.
+# These files are deleted after the zpaq add step.
+# Use a ZFS dataset with high compression enabled for space savings.
+# Ensure enough free space for all databases simultaneously (combined mode).
+DUMP_TMPDIR="/data/dumps"
+
+# Estimated total dump size in GB used on first run (no history yet).
+# This is a safety check estimate only — actual sizes are measured
+# after the first run and stored in a history file.
+DUMP_SPACE_ESTIMATE_GB="10"
+
+# Filesystem usage percentage at which to log a WARNING.
+DUMP_SPACE_WARN_PCT="80"
+
+# Filesystem usage percentage at which to ABORT before dumping.
+DUMP_SPACE_ABORT_PCT="95"
+
+# ============================================================
+# Compression
+# ============================================================
+
+# xz compression level (1-9). Default 6 is a good balance of
+# speed and ratio for low-end hardware. Increase to 9 for
+# maximum compression when CPU/RAM are not a constraint.
+# Note: xz -9 uses ~700MB RAM; xz -6 uses ~100MB RAM.
+DUMP_XZ_LEVEL="6"
+
+# xz thread count. Default 1 to limit CPU usage on low-end hardware.
+# Set to 0 for auto (use all cores) or a specific number.
+DUMP_XZ_THREADS="1"
+
+# ============================================================
+# Backup Mode
+# ============================================================
+
+# 'combined' (default): Dump and upload all databases first, then
+# run a single zpaqfranz add for all of them. This gives the best
+# deduplication since all files are compared in one pass.
+#
+# 'normal': Dump, upload, and zpaq each database individually before
+# moving to the next. Uses less peak disk space but deduplication
+# only applies against the archive history, not the current run.
+DUMP_MODE="combined"
+
+# ============================================================
+# MySQL Health Check
+# ============================================================
+
+# Number of times to retry the MySQL ping before aborting.
+DUMP_MYSQL_PING_RETRIES="5"
+
+# Seconds to wait between ping retries.
+DUMP_MYSQL_PING_SLEEP="10"
+
+# ============================================================
+# Retention Policy (S3 only — no local xz files exist)
+# ============================================================
+
+# Number of days to keep all backups (daily window).
+# Backups newer than this are always kept regardless of count.
+DUMP_RETENTION_DAILY_DAYS="7"
+
+# Number of weeks of weekly backups to retain after the daily window.
+# One backup per ISO week is kept (most recent of that week).
+DUMP_RETENTION_WEEKLY_WEEKS="4"
+
+# Number of months of monthly backups to retain after the weekly window.
+# One backup per calendar month is kept (most recent of that month).
+DUMP_RETENTION_MONTHLY_MONTHS="12"
+
+# After the monthly window (> 12 months): one backup per calendar year,
+# kept indefinitely. No configuration needed.
+
+# ============================================================
+# Logging
+# ============================================================
+
+# Directory for log files.
+# Defaults to ZPAQ_LOCAL_DIR/logs if not set.
+LOG_DIR=""
+
+# Rotate daily log files older than this many days.
+# Error logs are never auto-deleted.
+LOG_RETENTION_DAYS="30"

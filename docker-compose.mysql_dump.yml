@@ -1,0 +1,162 @@
+# ============================================================
+# docker-compose.mysql_dump.yml
+#
+# MySQL dump + zpaq backup service.
+#
+# Usage:
+#   Once-and-exit (triggered manually or from host cron):
+#     docker compose -f docker-compose.mysql_dump.yml run --rm mysql-dump
+#
+#   Or via host cron (recommended):
+#     0 3 * * * cd /opt/backups && docker compose -f docker-compose.mysql_dump.yml run --rm mysql-dump
+#
+#   Build the image:
+#     docker compose -f docker-compose.mysql_dump.yml build
+#
+# Volumes:
+#   dumps  — ephemeral raw .sql files (ZFS compressed dataset recommended)
+#   zpaq   — permanent .zpaq parts    (ZFS uncompressed dataset recommended)
+#
+# All sensitive values should be set in a .env file (chmod 600)
+# rather than hardcoded here. docker-compose automatically loads
+# a .env file from the same directory as the compose file.
+# ============================================================
+
+services:
+  mysql-dump:
+    build:
+      context: .
+      dockerfile: Dockerfile.mysql_dump
+      args:
+        # Pin specific zpaqfranz version if needed
+        ZPAQFRANZ_VERSION: "60.5"
+
+    image: mysql-dump-zpaq:latest
+
+    # Once-and-exit: never restart automatically
+    restart: "no"
+
+    # ============================================================
+    # Environment variables — all config can be set here or in .env
+    # ============================================================
+    environment:
+
+      # --- MySQL connection ---
+      MYSQL_HOST: "${MYSQL_HOST:-mysql}"        # service name if in same compose network
+      MYSQL_PORT: "${MYSQL_PORT:-3306}"
+      MYSQL_USER: "${MYSQL_USER:-backup}"
+      MYSQL_PASS: "${MYSQL_PASS:-}"             # set in .env file
+
+      # Comma-separated list of databases (empty = all minus ignored)
+      # MYSQL_DATABASES: "db1,db2"              # use -d flag or set here if needed
+
+      # --- zpaq archive identity ---
+      # Set this to the hostname of the Docker host for a stable archive name.
+      # Using a meaningful name ensures all backups from this instance
+      # append to the same archive.
+      BACKUP_HOSTNAME: "${BACKUP_HOSTNAME:-mysql-backup-01}"
+
+      # --- S3 / mc ---
+      MC_ALIAS: "${MC_ALIAS:-ovh}"
+      S3_ENDPOINT: "${S3_ENDPOINT:-}"           # e.g. https://s3.bhs.io.cloud.ovh.net
+      S3_ACCESS_KEY: "${S3_ACCESS_KEY:-}"
+      S3_SECRET_KEY: "${S3_SECRET_KEY:-}"
+      S3_BUCKET: "${S3_BUCKET:-}"
+      S3_INSECURE: "${S3_INSECURE:-1}"          # OVH requires --insecure
+      S3_MYSQL_PREFIX: "${S3_MYSQL_PREFIX:-mysql}"
+      S3_ZPAQ_PREFIX: "${S3_ZPAQ_PREFIX:-zpaq}"
+
+      # --- Backup mode ---
+      DUMP_MODE: "${DUMP_MODE:-combined}"
+
+      # --- Compression ---
+      DUMP_XZ_LEVEL: "${DUMP_XZ_LEVEL:-6}"
+      DUMP_XZ_THREADS: "${DUMP_XZ_THREADS:-1}"
+
+      # --- Paths (match volume mount points below) ---
+      DUMP_TMPDIR: /data/dumps
+      ZPAQ_LOCAL_DIR: /data/zpaq
+
+      # --- Grants backup ---
+      DUMP_GRANTS: "${DUMP_GRANTS:-true}"
+
+      # --- Retention ---
+      DUMP_RETENTION_DAILY_DAYS: "${DUMP_RETENTION_DAILY_DAYS:-7}"
+      DUMP_RETENTION_WEEKLY_WEEKS: "${DUMP_RETENTION_WEEKLY_WEEKS:-4}"
+      DUMP_RETENTION_MONTHLY_MONTHS: "${DUMP_RETENTION_MONTHLY_MONTHS:-12}"
+
+      # --- Logging ---
+      LOG_RETENTION_DAYS: "${LOG_RETENTION_DAYS:-30}"
+
+      # --- zpaq archive settings ---
+      # WARNING: ZPAQ_METHOD and ZPAQ_FRAGMENT cannot be changed
+      # after the first backup. The archive stores these values in
+      # the manifest and all future adds must use the same settings.
+      ZPAQ_METHOD: "${ZPAQ_METHOD:-5}"
+      ZPAQ_FRAGMENT: "${ZPAQ_FRAGMENT:-3}"
+
+    # ============================================================
+    # Volumes
+    # ============================================================
+    volumes:
+      # Ephemeral raw SQL dumps — high-compression ZFS dataset recommended.
+      # Files are deleted after zpaq add. Needs enough space for all
+      # databases simultaneously in combined mode.
+      - dumps:/data/dumps
+
+      # Permanent zpaq parts — uncompressed ZFS dataset recommended
+      # (zpaq files are already compressed; ZFS compression wastes CPU).
+      # These parts must NEVER be deleted manually. Plan for long-term
+      # storage capacity here.
+      - zpaq:/data/zpaq
+
+      # mc config persistence — preserves the mc alias across runs
+      # so it doesn't need to be recreated on each invocation.
+      - mc-config:/root/.mc
+
+    # ============================================================
+    # Network — set to reach the MySQL server
+    # ============================================================
+    # If MySQL is in the same compose stack, add its network here:
+    # networks:
+    #   - mysql_network
+    #
+    # If MySQL is on the Docker host or an external server, use
+    # MYSQL_HOST with the appropriate IP/hostname and no custom network.
+
+# ============================================================
+# Named volumes
+# ============================================================
+volumes:
+  dumps:
+    # Uncomment and set driver_opts to bind-mount a specific host path:
+    # driver: local
+    # driver_opts:
+    #   type: none
+    #   o: bind
+    #   device: /mnt/zfs-compressed/mysql-dumps
+
+  zpaq:
+    # driver: local
+    # driver_opts:
+    #   type: none
+    #   o: bind
+    #   device: /mnt/zfs-uncompressed/mysql-zpaq
+
+  mc-config:
+    # Small volume — stores mc alias configuration only
+
+# ============================================================
+# Example .env file (save as .env, chmod 600):
+#
+#   MYSQL_HOST=10.0.0.5
+#   MYSQL_USER=backup
+#   MYSQL_PASS=strongpassword
+#   BACKUP_HOSTNAME=db-prod-01
+#   S3_ENDPOINT=https://s3.bhs.io.cloud.ovh.net
+#   S3_ACCESS_KEY=0bbeXYZabc123
+#   S3_SECRET_KEY=accXYZsecretkey
+#   S3_BUCKET=my-db-backups
+#   S3_INSECURE=1
+#
+# ============================================================

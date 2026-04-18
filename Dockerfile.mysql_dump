@@ -1,0 +1,146 @@
+# ============================================================
+# Dockerfile.mysql_dump
+#
+# Builds a self-contained image for mysql_dump_zpaq.sh.
+#
+# Included tools:
+#   - mysql-client (MySQL 8.0 compatible via default-mysql-client)
+#   - xz-utils     (xz compression)
+#   - mc           (MinIO client — piped S3 uploads)
+#   - zpaqfranz    (multipart deduplicated archive)
+#   - python3      (manifest JSON handling)
+#   - util-linux   (ionice)
+#   - procps       (nice, already in base but explicit)
+#   - coreutils    (sha256sum, stat, etc.)
+#
+# Build:
+#   docker build -f Dockerfile.mysql_dump -t mysql-dump-zpaq .
+#
+# Run (once-and-exit):
+#   docker run --rm \
+#     -e MYSQL_HOST=db \
+#     -e MYSQL_USER=backup \
+#     -e MYSQL_PASS=secret \
+#     -e BACKUP_HOSTNAME=myserver \
+#     -e S3_ENDPOINT=https://s3.bhs.io.cloud.ovh.net \
+#     -e S3_ACCESS_KEY=... \
+#     -e S3_SECRET_KEY=... \
+#     -e S3_BUCKET=mybackups \
+#     -e S3_INSECURE=1 \
+#     -v /data/dumps:/data/dumps \
+#     -v /data/zpaq:/data/zpaq \
+#     mysql-dump-zpaq
+# ============================================================
+
+FROM debian:bookworm-slim
+
+# Build arguments for version pinning
+ARG ZPAQFRANZ_VERSION="60.5"
+ARG MC_ARCH="linux-amd64"
+ARG DEBIAN_FRONTEND=noninteractive
+
+# ============================================================
+# System packages
+# ============================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        # MySQL 8.0 compatible client tools
+        default-mysql-client \
+        # Compression
+        xz-utils \
+        # Core utilities (sha256sum, stat, nice, etc.)
+        coreutils \
+        # ionice
+        util-linux \
+        # Python 3 for manifest JSON handling
+        python3 \
+        # Runtime dependencies
+        ca-certificates \
+        curl \
+        wget \
+        # Process tools
+        procps \
+        # Needed for hostname -s
+        hostname \
+    && rm -rf /var/lib/apt/lists/*
+
+# ============================================================
+# MinIO client (mc)
+# ============================================================
+RUN set -eux; \
+    MC_URL="https://dl.min.io/client/mc/release/${MC_ARCH}/mc"; \
+    wget -q -O /usr/local/bin/mc "${MC_URL}"; \
+    chmod +x /usr/local/bin/mc; \
+    mc --version
+
+# ============================================================
+# zpaqfranz
+# Tries the GitHub releases page for the requested version.
+# Falls back to building from source if binary not available.
+# ============================================================
+RUN set -eux; \
+    ZPAQ_URL="https://github.com/fcorbelli/zpaqfranz/releases/download/v${ZPAQFRANZ_VERSION}/zpaqfranz-linux-amd64"; \
+    if wget -q -O /usr/local/bin/zpaqfranz "${ZPAQ_URL}" 2>/dev/null; then \
+        chmod +x /usr/local/bin/zpaqfranz; \
+        echo "zpaqfranz downloaded from GitHub"; \
+    else \
+        echo "Binary not found at ${ZPAQ_URL} — building from source"; \
+        apt-get update && apt-get install -y --no-install-recommends g++ make && \
+        rm -rf /var/lib/apt/lists/*; \
+        wget -q -O /tmp/zpaqfranz.tar.gz \
+            "https://github.com/fcorbelli/zpaqfranz/archive/refs/tags/v${ZPAQFRANZ_VERSION}.tar.gz"; \
+        tar -xzf /tmp/zpaqfranz.tar.gz -C /tmp; \
+        cd /tmp/zpaqfranz-${ZPAQFRANZ_VERSION}; \
+        g++ -O3 -o /usr/local/bin/zpaqfranz zpaqfranz.cpp -lpthread; \
+        rm -rf /tmp/zpaqfranz*; \
+    fi; \
+    zpaqfranz 2>&1 | head -2 || true
+
+# ============================================================
+# Copy scripts
+# ============================================================
+WORKDIR /opt/mysql_dump
+
+# Core logging module (reused from existing codebase)
+COPY src/core/logging.sh         src/core/logging.sh
+
+# zpaq utils (detect_zpaqfranz, zpaq_calc_threads)
+COPY src/zpaq/zpaq_utils.sh      src/zpaq/zpaq_utils.sh
+
+# MySQL-specific modules
+COPY src/mysql/mysql_dump_ops.sh  src/mysql/mysql_dump_ops.sh
+COPY src/mysql/mysql_retention.sh src/mysql/mysql_retention.sh
+COPY src/mysql/mysql_zpaq_ops.sh  src/mysql/mysql_zpaq_ops.sh
+
+# Main script
+COPY mysql_dump_zpaq.sh           mysql_dump_zpaq.sh
+
+# Set permissions
+RUN chmod +x mysql_dump_zpaq.sh \
+             src/core/logging.sh \
+             src/zpaq/zpaq_utils.sh \
+             src/mysql/mysql_dump_ops.sh \
+             src/mysql/mysql_retention.sh \
+             src/mysql/mysql_zpaq_ops.sh
+
+# ============================================================
+# Runtime configuration
+# ============================================================
+
+# Default data directories — override via volume mounts
+ENV DUMP_TMPDIR=/data/dumps
+ENV ZPAQ_LOCAL_DIR=/data/zpaq
+
+# Create data directories (will be overridden by volume mounts)
+RUN mkdir -p /data/dumps /data/zpaq
+
+# mc config directory
+ENV MC_CONFIG_DIR=/root/.mc
+
+# ============================================================
+# Entrypoint
+# ============================================================
+# The script runs once and exits. No daemon, no cron.
+# Schedule externally via host cron, systemd timer, or
+# docker compose run / docker run from cron.
+ENTRYPOINT ["/opt/mysql_dump/mysql_dump_zpaq.sh"]
+CMD []
