@@ -1,6 +1,6 @@
 # ftp-sftp-transfer
 
-A collection of Bash scripts for transferring, archiving, splitting, and recompressing files between FTP servers, SFTP servers, and local storage. All scripts share a common configuration file (`transfer.conf`), logging conventions, and reusable `src/` modules.
+A collection of Bash scripts for transferring, archiving, splitting, recompressing, and backing up files between FTP servers, SFTP servers, S3-compatible object storage, and local storage. All scripts share common logging conventions and reusable `src/` modules.
 
 ---
 
@@ -17,6 +17,8 @@ A collection of Bash scripts for transferring, archiving, splitting, and recompr
 | `zpaq_archive.sh` | Download files from FTP/SFTP/local sources and add them to a single-file `.zpaq` super-archive | [docs/zpaq.md](docs/zpaq.md) |
 | `storezpaq.sh` | Upload a single-file `.zpaq` archive to SFTP with integrity checking, atomic upload, and timestamped backup rotation | [docs/zpaq.md](docs/zpaq.md) |
 | `storezpaq_multi.sh` | Download compressed sources, decompress, group by date, and build a growing **multipart** `.zpaq` archive with atomic per-part upload to SFTP | [docs/zpaq.md](docs/zpaq.md) |
+| `repack_zpaq.sh` | Extract files from `.zpaq` archives, recompress each to `.bz2`, and upload to SFTP — with ramdisk acceleration, resume support, and file ignore patterns | [docs/zpaq.md](docs/zpaq.md) |
+| `mysql_dump_zpaq.sh` | Dump MySQL databases, stream-compress each to S3 via `mc pipe`, and add raw dumps to a persistent deduplicated multipart `.zpaq` archive | [docs/mysql_dump.md](docs/mysql_dump.md) |
 
 ---
 
@@ -37,6 +39,12 @@ sudo apt-get install zpaqfranz        # Debian 13+
 
 # storezpaq_multi.sh additional decompressors (optional, for best performance)
 sudo apt-get install -y lbzip2 pigz
+
+# mysql_dump_zpaq.sh (or use the provided Docker image)
+sudo apt-get install -y default-mysql-client xz-utils python3 util-linux
+# mc (MinIO client):
+wget -q -O /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc
+chmod +x /usr/local/bin/mc
 ```
 
 ### 2. Configure
@@ -47,7 +55,7 @@ nano transfer.conf
 chmod 600 transfer.conf
 ```
 
-All scripts read `transfer.conf` (or `storezpaq.conf` for `storezpaq_multi.sh`) from the same directory. See [Configuration](#configuration) below for the full variable reference.
+All scripts read `transfer.conf` (or a script-specific config file) from the same directory. See [Configuration](#configuration) below for the full variable reference.
 
 ### 3. Run
 
@@ -69,13 +77,22 @@ All scripts read `transfer.conf` (or `storezpaq.conf` for `storezpaq_multi.sh`) 
 
 # Backfill all unarchived history in one pass
 ./storezpaq_multi.sh -backfill myarchive sftp://host/backups/'*.sql.xz'
+
+# Repack a zpaq archive to .bz2 and upload to SFTP
+./repack_zpaq.sh -c transfer.conf 'archive???????.zpaq'
+
+# Repack while ignoring a corrupt subdirectory
+./repack_zpaq.sh -i 'slim/*' -i 'slim/broken.sql' 'archive???????.zpaq'
+
+# Dump MySQL databases to S3 + zpaq (Docker — recommended)
+docker compose -f docker-compose.mysql_dump.yml run --rm mysql-dump
 ```
 
 ---
 
 ## Configuration
 
-### transfer.conf — Shared by all scripts except storezpaq_multi.sh
+### transfer.conf — Shared by transfer.sh, split scripts, repack_zpaq.sh
 
 Copy `transfer.example.conf` as a starting point.
 
@@ -126,7 +143,7 @@ VERIFY_ARCHIVE_INTEGRITY=true
 
 ### storezpaq.conf — storezpaq_multi.sh
 
-`storezpaq_multi.sh` reads `storezpaq.conf` (in the same directory as the script) rather than `transfer.conf`. The config file is **optional** — all keys have built-in defaults and can be overridden at the command line. Only the five required variables must be set (via config or CLI flags).
+`storezpaq_multi.sh` reads `storezpaq.conf` (in the same directory as the script) rather than `transfer.conf`. The config file is **optional** — all keys have built-in defaults and can be overridden at the command line.
 
 ```bash
 # === Required ===
@@ -146,30 +163,60 @@ ZPAQ_THREADS=""                  # default: 25% of nproc, max 8
 
 # === Multipart naming ===
 ZPAQ_MULTIPART_QUESTION_MARKS=7  # Number of ? in archive pattern (default: 7)
-                                 # basename??????? → basename0000001.zpaq, etc.
-
-# === Decompression ===
-XZ_DECOMPRESS_THREADS=4          # Threads for xz -d (default: 4)
 
 # === Space management ===
-ZPAQ_HEADROOM_RATIO=0.30         # Extra headroom fraction on top of estimated size (default: 0.30)
-BACKFILL_MIN_FREE_GB=100         # Minimum free disk floor for backfill mode (default: 100)
-SIZE_HISTORY_SAMPLES=5           # Number of recent .bz2 decompressions to average (default: 5)
-SIZE_ESTIMATE_SAFETY_FACTOR=1.20 # Safety multiplier applied to bz2 estimates (default: 1.20)
-BZ2_DEFAULT_RATIO=3.5            # Fallback bz2 expansion ratio when no history exists (default: 3.5)
-
-# === ARG_MAX protection ===
-ARGMAX_SAFE_THRESHOLD=131072     # Max bytes in zpaqfranz file list before falling back to . (default: 131072)
-
-# === Upload ===
-UPLOAD_RETRY_COUNT=3             # Per-part upload retry attempts (default: 3)
-
-# === Monitoring ===
-ZPAQ_LOCAL_SIZE_WARN_GB=500      # Warn when local archive set exceeds this size (default: 500)
+ZPAQ_HEADROOM_RATIO=0.30
+BACKFILL_MIN_FREE_GB=100
+SIZE_HISTORY_SAMPLES=5
+SIZE_ESTIMATE_SAFETY_FACTOR=1.20
+BZ2_DEFAULT_RATIO=3.5
 
 # === Logging ===
 LOG_DIR=""                       # default: ZPAQ_LOCAL_DIR/logs
-LOG_RETENTION_DAYS=30            # default: 30
+LOG_RETENTION_DAYS=30
+```
+
+### mysql_dump.conf — mysql_dump_zpaq.sh
+
+`mysql_dump_zpaq.sh` reads `mysql_dump.conf`. All variables can also be passed as environment variables, which is the recommended approach for Docker deployments. See `mysql_dump.conf.example` for the full reference.
+
+```bash
+# === MySQL connection ===
+MYSQL_HOST="127.0.0.1"
+MYSQL_PORT="3306"
+MYSQL_USER="backup"
+MYSQL_PASS=""
+MYSQL_DATABASES=()               # empty = all (minus MYSQL_IGNORE_DATABASES)
+MYSQL_IGNORE_DATABASES=(information_schema mysql performance_schema sys)
+DUMP_GRANTS="true"               # Also dump user grants/privileges
+
+# === S3 / mc ===
+MC_ALIAS="ovh"
+S3_ENDPOINT=""                   # e.g. https://s3.bhs.io.cloud.ovh.net
+S3_ACCESS_KEY=""
+S3_SECRET_KEY=""
+S3_BUCKET=""
+S3_INSECURE=""                   # Set to any non-empty value to add --insecure
+S3_MYSQL_PREFIX="mysql"          # s3://bucket/mysql/<db>/<db>_YYYYMMDD_HHMM.sql.xz
+S3_ZPAQ_PREFIX="zpaq"            # s3://bucket/zpaq/<hostname>0000001.zpaq
+
+# === zpaq archive ===
+ZPAQ_LOCAL_DIR="/data/zpaq"      # Permanent local storage for .zpaq parts
+ZPAQ_METHOD="5"                  # WARNING: cannot change after first add
+ZPAQ_FRAGMENT="3"
+BACKUP_HOSTNAME=""               # zpaq basename; defaults to $(hostname -s)
+
+# === Working directory ===
+DUMP_TMPDIR="/data/dumps"        # Raw .sql files (ZFS-compressed dataset recommended)
+DUMP_XZ_LEVEL="6"
+DUMP_XZ_THREADS="1"
+DUMP_MODE="combined"             # 'combined' (default) or 'normal'
+
+# === Retention (S3 only) ===
+DUMP_RETENTION_DAILY_DAYS="7"
+DUMP_RETENTION_WEEKLY_WEEKS="4"
+DUMP_RETENTION_MONTHLY_MONTHS="12"
+# Yearly: one per year, kept indefinitely
 ```
 
 ---
@@ -282,18 +329,16 @@ Uploads a `.zpaq` archive to SFTP with a 5-step safety workflow:
 
 ### storezpaq_multi.sh — Multipart zpaq Archive from Compressed Sources
 
-Downloads compressed source files (`.xz`, `.bz2`, `.gz`, `.zip`, `.sql`) from SFTP, FTP, or local paths, decompresses them into a flat staging area, groups them by date extracted from filenames (`*_YYYYMMDD.*`), and appends each group to a growing multipart `.zpaq` archive using `zpaqfranz`. Each part is atomically uploaded and sha256-verified before the next group is processed.
+Downloads compressed source files (`.xz`, `.bz2`, `.gz`, `.zip`, `.sql`) from SFTP, FTP, or local paths, decompresses them into a flat staging area, groups them by date extracted from filenames (`*_YYYYMMDD.*`), and appends each group to a growing multipart `.zpaq` archive. Each part is atomically uploaded and sha256-verified before the next group is processed.
 
 Key features:
 
-- **Multipart naming** — `basename???????` pattern produces `basename0000001.zpaq`, `basename0000002.zpaq`, etc. All parts are retained locally (required for zpaqfranz cross-part deduplication)
-- **Fragment lock-in** — `ZPAQ_FRAGMENT` (default 3) is written to the manifest on first add and validated on every subsequent run; mismatches abort immediately
-- **Single content cache** — one `zpaqfranz l` at startup builds an in-memory lookup; no per-file archive scans
-- **Pre-add remote sync** — downloads any parts present on SFTP but missing locally before adding new content
+- **Multipart naming** — `basename???????` pattern produces `basename0000001.zpaq`, `basename0000002.zpaq`, etc.
+- **Fragment lock-in** — `ZPAQ_FRAGMENT` is written to the manifest on first add and validated on every subsequent run
+- **Single content cache** — one `zpaqfranz l` at startup; no per-file archive scans
+- **Pre-add remote sync** — downloads any parts present on SFTP but missing locally before adding
 - **Per-part atomic upload** — upload to `.tmp_upload` → download-back sha256 verify → rename live → update manifest
 - **Backfill mode** (`-backfill`) — combines all unarchived date groups into a single `zpaqfranz add` for maximum cross-file deduplication
-- **bz2 size estimation** — uses a per-basename history file of actual compressed/uncompressed ratios (last 5 samples × 1.20 safety factor) since bzip2 has no uncompressed-size metadata
-- **ARG_MAX protection** — passes an explicit file list to zpaqfranz; falls back to a `.` sweep when the total argument bytes exceed `ARGMAX_SAFE_THRESHOLD` (128 KB)
 
 ```bash
 # Normal mode — one zpaq add per date group
@@ -307,14 +352,154 @@ Key features:
 
 # Dry run — show what would be done without making changes
 ./storezpaq_multi.sh -dry-run myarchive sftp://host/backups/'*.sql.xz'
-
-# Multiple sources with explicit credentials
-./storezpaq_multi.sh -u admin -p secret myarchive \
-    sftp://host/slim/'*.sql.bz2' \
-    sftp://host/vxtl/'*.sql.xz'
 ```
 
 → [Full documentation](docs/zpaq.md)
+
+---
+
+### repack_zpaq.sh — Repack zpaq Archives to .bz2 + SFTP
+
+Reads one or more `.zpaq` archives (including multipart via `???????` glob patterns), extracts every stored file using `zpaqfranz`, recompresses each to `.bz2` using `pbzip2`, and uploads the result to an SFTP server. Internal subpaths are preserved verbatim.
+
+Three overlapping background workers (extract → compress → upload) run concurrently. A ramdisk (`tmpfs`) is mounted for extracted files that fit in available RAM. Completed queue entries are tracked for resume across interrupted runs.
+
+**File ignore patterns** allow skipping corrupt or unwanted files inside the archive without aborting the entire run:
+
+```bash
+# Ignore everything under the slim/ subdirectory
+./repack_zpaq.sh -i 'slim/*' 'archive???????.zpaq'
+
+# Ignore recursively (all depths)
+./repack_zpaq.sh -i 'slim/**' 'archive???????.zpaq'
+
+# Ignore a specific file
+./repack_zpaq.sh -i 'slim/broken_dump.sql' 'archive???????.zpaq'
+
+# Multiple patterns (leading / stripped automatically)
+./repack_zpaq.sh -i '/slim/*' -i '/tmp/junk.dat' 'archive???????.zpaq'
+
+# Dry run — show what would be extracted, compressed, uploaded, and ignored
+./repack_zpaq.sh -dry-run -i 'slim/*' 'archive???????.zpaq'
+```
+
+Ignore patterns can also be set permanently in `transfer.conf` via the `REPACK_IGNORE_PATTERNS` bash array:
+
+```bash
+# In transfer.conf:
+REPACK_IGNORE_PATTERNS=(
+    'slim/*'
+    'tmp/junk.dat'
+    'logs/**'
+)
+```
+
+Pattern matching rules:
+- `slim/*` — single-level wildcard: matches `slim/foo.sql` but **not** `slim/sub/foo.sql`
+- `slim/**` — recursive wildcard: matches `slim/foo.sql`, `slim/sub/foo.sql`, `slim/a/b/c.sql`
+- `slim/broken.sql` — exact path match
+- Leading `/` is stripped from both patterns and paths before matching
+
+```bash
+./repack_zpaq.sh [OPTIONS] <archive.zpaq|'pattern???????.zpaq'> [...]
+
+Options:
+  -c FILE     Config file                           (default: transfer.conf)
+  -u USER     SFTP username override
+  -p PASS     SFTP password override
+  -o DIR      Local output directory for .bz2 files
+  -r DIR      Remote SFTP base directory override
+  -b N        pbzip2 block size in 100KB steps      (default: 100 = 10MB)
+  -m N        pbzip2 memory limit in MB             (default: 2000)
+  -i PATTERN  Ignore files matching PATTERN         (repeatable)
+  -dry-run    Show what would happen; make no changes
+  -v          Verbose / DEBUG output
+```
+
+→ [Full documentation](docs/zpaq.md)
+
+---
+
+### mysql_dump_zpaq.sh — MySQL Backup to S3 + zpaq
+
+Dumps all (or specified) MySQL databases, compresses each with `xz` and pipes directly to S3 via `mc pipe` (no local `.xz` file is ever written), then adds the raw `.sql` dump files to a persistent multipart `zpaqfranz` archive for long-term deduplicated storage.
+
+**Designed to run in Docker** — all configuration via environment variables. Triggers once-and-exit; schedule with host cron or `docker compose run`.
+
+#### Three-phase backup pipeline
+
+```
+Phase 1 — Dump:
+  mysqldump <db> | tee >(sha256sum → .sha256) → <db>/<db>_YYYYMMDD_HHMM.sql
+  (ZFS compression handles on-disk space savings automatically)
+
+Phase 2 — Compress + S3 upload (no local .xz):
+  xz -6 -T1 | mc pipe s3://bucket/mysql/<db>/<db>_YYYYMMDD_HHMM.sql.xz
+  mc cp .sha256 sidecar → S3
+
+Phase 3 — zpaq archive:
+  zpaqfranz a <hostname>??????? <all .sql files>
+  mc cp new .zpaq part → s3://bucket/zpaq/
+  delete .sql files
+```
+
+#### Combined vs Normal mode
+
+**Combined mode** (default `DUMP_MODE=combined`): All databases are dumped and uploaded to S3 first, then a single `zpaqfranz a` adds all of them in one pass. This gives maximum deduplication since all current-run files are compared together.
+
+**Normal mode** (`DUMP_MODE=normal`): Each database goes through all three phases individually before the next one starts. Lower peak disk usage, but deduplication only applies against the archive history.
+
+#### Grants backup
+
+When `DUMP_GRANTS=true` (default), all user grants are captured via a `SHOW GRANTS FOR` loop and stored as `_grants/_grants_YYYYMMDD_HHMM.sql`. The grants file participates in all three phases and GFS retention identically to a regular database.
+
+#### GFS Retention (S3 only)
+
+Applied per-database after each run. No local `.xz` files to manage.
+
+| Window | Policy |
+|--------|--------|
+| < 7 days | Keep all backups |
+| 7–30 days | Keep most recent per ISO week |
+| 30–365 days | Keep most recent per calendar month |
+| > 365 days | Keep most recent per year, indefinitely |
+
+When an `.xz` object is pruned, its `.sha256` sidecar is pruned with it.
+
+#### Docker usage
+
+```bash
+# Build
+docker compose -f docker-compose.mysql_dump.yml build
+
+# Run once (from host cron or manually)
+docker compose -f docker-compose.mysql_dump.yml run --rm mysql-dump
+
+# Host cron example (daily at 3 AM)
+0 3 * * * cd /opt/ftp-sftp-transfer && \
+  docker compose -f docker-compose.mysql_dump.yml run --rm mysql-dump \
+  >> /var/log/mysql-dump.log 2>&1
+```
+
+#### Environment variables (recommended for Docker)
+
+```bash
+MYSQL_HOST=mysql              # Docker service name or IP
+MYSQL_USER=backup
+MYSQL_PASS=secret
+BACKUP_HOSTNAME=db-prod-01    # Becomes the zpaq archive basename
+S3_ENDPOINT=https://s3.bhs.io.cloud.ovh.net
+S3_ACCESS_KEY=...
+S3_SECRET_KEY=...
+S3_BUCKET=my-backups
+S3_INSECURE=1                 # Required for OVH Object Storage
+DUMP_TMPDIR=/data/dumps       # Ephemeral raw SQL (ZFS-compressed volume)
+ZPAQ_LOCAL_DIR=/data/zpaq     # Permanent zpaq parts (ZFS-uncompressed volume)
+```
+
+See `mysql_dump.conf.example` for the complete variable reference.
+
+→ [Full documentation](docs/mysql_dump.md)
 
 ---
 
@@ -331,11 +516,16 @@ ftp-sftp-transfer/
 ├── zpaq_archive.sh         Build / update a single-file .zpaq super-archive
 ├── storezpaq.sh            Upload single-file .zpaq to SFTP with safety workflow
 ├── storezpaq_multi.sh      Build multipart .zpaq archive from compressed sources
+├── repack_zpaq.sh          Extract .zpaq → recompress to .bz2 → upload to SFTP
+├── mysql_dump_zpaq.sh      Dump MySQL → S3 (xz) + zpaqfranz archive
 │
-├── transfer.conf           Credentials and settings for all scripts except storezpaq_multi.sh
-├── storezpaq.conf          Credentials and settings for storezpaq_multi.sh (optional)
+├── transfer.conf           Credentials and settings (transfer.sh, split, repack)
 ├── transfer.example.conf   Example config — copy and edit
+├── mysql_dump.conf.example Example config for mysql_dump_zpaq.sh
 ├── exclude.list            Basename glob patterns to skip in transfer.sh
+│
+├── Dockerfile.mysql_dump   Docker image for mysql_dump_zpaq.sh
+├── docker-compose.mysql_dump.yml
 │
 ├── src/
 │   ├── core/               constants, args, config, logging
@@ -349,7 +539,8 @@ ftp-sftp-transfer/
 │   ├── zpaq/               zpaq_utils, zpaq_manifest,
 │   │                         zpaq_archive_ops, zpaq_sftp_ops,
 │   │                         zpaq_multipart_manifest, zpaq_multipart_ops,
-│   │                         zpaq_grouping
+│   │                         zpaq_grouping, zpaq_repack_ops
+│   ├── mysql/              mysql_dump_ops, mysql_retention, mysql_zpaq_ops
 │   ├── workers/            counters, disk_guard, download_worker, upload_worker
 │   └── pipeline/           pipeline, deletion_stage, summary, main
 │
@@ -357,7 +548,9 @@ ftp-sftp-transfer/
 │   ├── transfer.md         transfer.sh detailed documentation
 │   ├── split.md            split_transfer / split_upload / split_restore docs
 │   ├── compress.md         recompress / strip_archive docs
-│   ├── zpaq.md             zpaq_archive / storezpaq / storezpaq_multi docs
+│   ├── zpaq.md             zpaq_archive / storezpaq / storezpaq_multi /
+│   │                         repack_zpaq docs
+│   ├── mysql_dump.md       mysql_dump_zpaq.sh documentation
 │   └── modules.md          src/ module reference
 │
 └── logs/                   Run logs (auto-created)
@@ -380,6 +573,8 @@ Every script that reads or writes the same file uses a `flock`-based exclusive l
 | `zpaq_archive.sh` | `<archive>.zpaq.lock` |
 | `storezpaq.sh` | `<archive>.zpaq.lock` |
 | `storezpaq_multi.sh` | `<ZPAQ_LOCAL_DIR>/<basename>.zpaq.lock` |
+| `repack_zpaq.sh` | `<output_dir>/repack_zpaq.sh.lock` |
+| `mysql_dump_zpaq.sh` | Docker container lifecycle (once-and-exit prevents overlap) |
 
 Locks are OS-held via a file descriptor — automatically released if the process dies without calling `release_lock()`. No stale lock files after crashes.
 
@@ -388,9 +583,12 @@ Locks are OS-held via a file descriptor — automatically released if the proces
 ## Security Notes
 
 - **SFTP passwords** are passed via the `SSHPASS` environment variable (not a CLI argument) — invisible in `ps aux` and process listings.
+- **MySQL passwords** in `mysql_dump_zpaq.sh` are passed via `-p` flag to `mysqldump`. For production use, consider a MySQL `.mylogin.cnf` credential file instead.
+- **S3 credentials** for `mysql_dump_zpaq.sh` are stored in the `mc` alias config (`~/.mc/config.json`). Pass them as environment variables in Docker rather than baking them into the image.
 - **FTP** uses plain unencrypted FTP (`set ftp:ssl-allow no`) — appropriate only on a trusted intranet.
 - **Host key verification** uses `StrictHostKeyChecking=no` by default for first-run convenience. For hardened environments, pre-populate `~/.ssh/known_hosts` via `ssh-keyscan` and switch to `yes`.
-- **Config file** must be `chmod 600`. All scripts warn on startup if permissions are too open.
+- **Config files** must be `chmod 600`. All scripts warn on startup if permissions are too open.
+- **OVH Object Storage** requires `--insecure` for `mc` (`S3_INSECURE=1`). This disables TLS certificate verification for the S3 endpoint only.
 
 ---
 
@@ -409,6 +607,11 @@ Locks are OS-held via a file descriptor — automatically released if the proces
 0 4 * * * /opt/ftp-sftp-transfer/storezpaq_multi.sh myarchive \
           sftp://host/backups/'*.sql.xz' \
           >> /opt/ftp-sftp-transfer/logs/multi_cron.log 2>&1
+
+# Daily MySQL backup at 3:00 AM via Docker
+0 3 * * * cd /opt/ftp-sftp-transfer && \
+          docker compose -f docker-compose.mysql_dump.yml run --rm mysql-dump \
+          >> /var/log/mysql-dump.log 2>&1
 ```
 
 Set `PATH` explicitly in crontab if binaries are not found:
