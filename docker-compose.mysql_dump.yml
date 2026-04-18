@@ -118,8 +118,9 @@ services:
     # Network — set to reach the MySQL server
     # ============================================================
     # If MySQL is in the same compose stack, add its network here:
-    # networks:
-    #   - mysql_network
+    networks:
+      cg-mysql:
+        external: true
     #
     # If MySQL is on the Docker host or an external server, use
     # MYSQL_HOST with the appropriate IP/hostname and no custom network.
