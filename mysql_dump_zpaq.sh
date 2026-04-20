@@ -112,6 +112,10 @@ STAT_DB_SKIPPED=0
 # Per-db result tracking: associative array db_name → "OK"|"FAILED"|"SKIPPED"
 declare -A DB_RESULTS=()
 
+# Cached mysqldump --help output — populated once on first dump, reused for all
+# subsequent databases to avoid re-probing the binary on every call.
+_MYSQLDUMP_CAPS=""
+
 # ============================================================
 # usage
 # ============================================================

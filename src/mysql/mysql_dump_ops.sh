@@ -249,6 +249,13 @@ dump_database() {
         return 0
     fi
 
+    # Probe mysqldump once for supported options (cached in _MYSQLDUMP_CAPS).
+    # We check --help output rather than server version so it reflects the
+    # actual client binary in the image regardless of server version.
+    if [[ -z "${_MYSQLDUMP_CAPS+set}" ]]; then
+        _MYSQLDUMP_CAPS=$(mysqldump --help 2>&1 || true)
+    fi
+
     local -a mysql_dump_args=(
         -h"${MYSQL_HOST}"
         -P"${MYSQL_PORT}"
@@ -258,11 +265,28 @@ dump_database() {
         --routines
         --triggers
         --events
-        --set-gtid-purged=OFF
-        --no-tablespaces
         --default-character-set=utf8mb4
-        "${db_name}"
     )
+
+    # --set-gtid-purged: only supported on MySQL 5.6.26+ / MariaDB 10.1.6+
+    # Omitting it on older clients is safe — GTID info simply won't be stripped.
+    if echo "${_MYSQLDUMP_CAPS}" | grep -q -- '--set-gtid-purged'; then
+        mysql_dump_args+=( --set-gtid-purged=OFF )
+        log "DEBUG" "dump_database: [${db_name}] --set-gtid-purged=OFF supported — adding"
+    else
+        log "DEBUG" "dump_database: [${db_name}] --set-gtid-purged not supported by this mysqldump — skipping"
+    fi
+
+    # --no-tablespaces: avoids requiring PROCESS privilege (MySQL 8.0.21+)
+    # Safe to omit on older clients — tablespace info is rarely needed in dumps.
+    if echo "${_MYSQLDUMP_CAPS}" | grep -q -- '--no-tablespaces'; then
+        mysql_dump_args+=( --no-tablespaces )
+        log "DEBUG" "dump_database: [${db_name}] --no-tablespaces supported — adding"
+    else
+        log "DEBUG" "dump_database: [${db_name}] --no-tablespaces not supported by this mysqldump — skipping"
+    fi
+
+    mysql_dump_args+=( "${db_name}" )
 
     # Dump: pipe through tee to capture sha256 of raw stream while writing to disk.
     # Stderr is captured to a temp file so we can log it on failure.
