@@ -193,6 +193,31 @@ parse_args() {
 # Config loading
 # ============================================================
 load_dump_config() {
+    # Snapshot any env vars that are already set before sourcing the config
+    # file. The config file uses plain assignment which would clobber them.
+    # After sourcing we restore the snapshot so that:
+    #   environment variables > config file > built-in defaults
+    local -a _env_snapshot_keys=(
+        MYSQL_HOST MYSQL_PORT MYSQL_USER MYSQL_PASS
+        MC_ALIAS S3_ENDPOINT S3_ACCESS_KEY S3_SECRET_KEY
+        S3_BUCKET S3_INSECURE S3_MYSQL_PREFIX S3_ZPAQ_PREFIX
+        BACKUP_HOSTNAME
+        ZPAQ_LOCAL_DIR ZPAQ_METHOD ZPAQ_FRAGMENT ZPAQ_MULTIPART_QUESTION_MARKS
+        DUMP_TMPDIR DUMP_SPACE_ESTIMATE_GB DUMP_SPACE_WARN_PCT DUMP_SPACE_ABORT_PCT
+        DUMP_XZ_LEVEL DUMP_XZ_THREADS DUMP_XZ_MAX_SIZE_GB
+        DUMP_MODE DUMP_GRANTS
+        DUMP_MYSQL_PING_RETRIES DUMP_MYSQL_PING_SLEEP
+        DUMP_RETENTION_DAILY_DAYS DUMP_RETENTION_WEEKLY_WEEKS DUMP_RETENTION_MONTHLY_MONTHS
+        LOG_DIR LOG_RETENTION_DAYS
+    )
+    local -A _env_snapshot=()
+    local _k
+    for _k in "${_env_snapshot_keys[@]}"; do
+        if [[ -v "${_k}" ]]; then
+            _env_snapshot["${_k}"]="${!_k}"
+        fi
+    done
+
     # Source config file if present
     if [[ -f "${CLI_CONFIG}" ]]; then
         local perms
@@ -205,6 +230,13 @@ load_dump_config() {
     else
         echo "WARNING: Config file not found: ${CLI_CONFIG} — using environment variables and built-in defaults" >&2
     fi
+
+    # Re-apply env var snapshot — env vars always win over config file values
+    for _k in "${_env_snapshot_keys[@]}"; do
+        if [[ -v "_env_snapshot[${_k}]" ]]; then
+            printf -v "${_k}" '%s' "${_env_snapshot[${_k}]}"
+        fi
+    done
 
     # CLI flags override config/env
     [[ -n "${CLI_MYSQL_HOST}" ]] && MYSQL_HOST="${CLI_MYSQL_HOST}"
@@ -455,11 +487,26 @@ process_one_db() {
 
     (( STAT_DB_DUMPED++ )) || true
 
-    # Record size in history for future disk space estimates
+    # Skip empty dumps — a zero-byte .sql is not a valid backup.
+    # This can happen when mysqldump succeeds but the database is truly empty
+    # (no tables, no data). Uploading and archiving an empty file wastes space
+    # and pollutes the zpaq archive with useless blocks.
+    local _sql_size=0
     if [[ "${CLI_DRY_RUN}" == false && -f "${_db_sql_out}" ]]; then
-        local sql_size
-        sql_size=$(stat -c "%s" "${_db_sql_out}" 2>/dev/null || echo 0)
-        _DUMP_SIZE_HISTORY["${db_name}"]="${sql_size}"
+        _sql_size=$(stat -c "%s" "${_db_sql_out}" 2>/dev/null || echo 0)
+    fi
+
+    if [[ "${CLI_DRY_RUN}" == false ]] && (( _sql_size == 0 )); then
+        log "WARN" "[${db_name}] Dump produced an empty file — skipping upload and zpaq"
+        rm -f "${_db_sql_out}" "${_db_sha_out}"
+        DB_RESULTS["${db_name}"]="SKIPPED:empty"
+        (( STAT_DB_SKIPPED++ )) || true
+        return 0
+    fi
+
+    # Record size in history for future disk space estimates
+    if [[ "${CLI_DRY_RUN}" == false ]]; then
+        _DUMP_SIZE_HISTORY["${db_name}"]="${_sql_size}"
     fi
 
     # Phase 2: xz → S3
