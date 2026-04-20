@@ -131,18 +131,18 @@ services:
 volumes:
   dumps:
     # Uncomment and set driver_opts to bind-mount a specific host path:
-    # driver: local
-    # driver_opts:
-    #   type: none
-    #   o: bind
-    #   device: /mnt/zfs-compressed/mysql-dumps
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/mysql-dumps
 
   zpaq:
-    # driver: local
-    # driver_opts:
-    #   type: none
-    #   o: bind
-    #   device: /mnt/zfs-uncompressed/mysql-zpaq
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/mysql-zpaq
 
   mc-config:
     # Small volume — stores mc alias configuration only
