@@ -119,11 +119,15 @@ services:
     # ============================================================
     # If MySQL is in the same compose stack, add its network here:
     networks:
-      cg-mysql:
-        external: true
+      - cg-mysql
     #
     # If MySQL is on the Docker host or an external server, use
     # MYSQL_HOST with the appropriate IP/hostname and no custom network.
+
+
+networks:
+  cg-mysql:
+    external: true
 
 # ============================================================
 # Named volumes
