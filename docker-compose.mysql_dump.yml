@@ -75,7 +75,7 @@ services:
       DUMP_MODE: "${DUMP_MODE:-combined}"
 
       # --- Compression ---
-      DUMP_XZ_LEVEL: "${DUMP_XZ_LEVEL:-6}"
+      DUMP_XZ_LEVEL: "${DUMP_XZ_LEVEL:-9}"
       DUMP_XZ_THREADS: "${DUMP_XZ_THREADS:-1}"
       # Max expected compressed upload size (GiB) — drives mc --part-size calc.
       # See mysql_dump.conf.example for full explanation.
