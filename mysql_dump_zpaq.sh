@@ -495,11 +495,18 @@ process_one_db() {
     # comments and SET statements) even for databases with no tables or data.
     # We check for meaningful content by looking for any CREATE TABLE, INSERT,
     # or CREATE VIEW statement. A header-only dump has none of these.
+    #
+    # _grants is exempt: it uses a custom format with GRANT/CREATE USER
+    # statements rather than DDL/DML, so it is always considered non-empty
+    # as long as the file exists and is non-zero.
     local _sql_size=0
     local _sql_has_content=false
     if [[ "${CLI_DRY_RUN}" == false && -f "${_db_sql_out}" ]]; then
         _sql_size=$(stat -c "%s" "${_db_sql_out}" 2>/dev/null || echo 0)
-        if grep -qE '^\s*(CREATE TABLE|INSERT INTO|CREATE VIEW|CREATE PROCEDURE|CREATE FUNCTION|CREATE TRIGGER|CREATE EVENT)' \
+        if [[ "${db_name}" == "_grants" ]]; then
+            # Grants dump: non-empty file is always meaningful
+            (( _sql_size > 0 )) && _sql_has_content=true
+        elif grep -qE '^\s*(CREATE TABLE|INSERT INTO|CREATE VIEW|CREATE PROCEDURE|CREATE FUNCTION|CREATE TRIGGER|CREATE EVENT)' \
                 "${_db_sql_out}" 2>/dev/null; then
             _sql_has_content=true
         fi
