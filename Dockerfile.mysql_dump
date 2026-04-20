@@ -80,13 +80,14 @@ RUN set -eux; \
 RUN set -eux; \
     echo "Building from source"; \
     apt-get update && apt-get install -y --no-install-recommends g++ make && \
-    rm -rf /var/lib/apt/lists/*; \
     wget -q -O /tmp/zpaqfranz.tar.gz \
         "https://github.com/fcorbelli/zpaqfranz/archive/refs/tags/${ZPAQFRANZ_VERSION}.tar.gz"; \
     tar -xzf /tmp/zpaqfranz.tar.gz -C /tmp; \
     cd /tmp/zpaqfranz-${ZPAQFRANZ_VERSION}; \
     g++ -O3 -o /usr/local/bin/zpaqfranz zpaqfranz.cpp -lpthread; \
     rm -rf /tmp/zpaqfranz*; \
+    apt-get remove -y g++ make \
+    rm -rf /var/lib/apt/lists/*; \
     zpaqfranz 2>&1 | head -2 || true
 
 # ============================================================
