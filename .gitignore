@@ -2,3 +2,4 @@ transfer.conf
 /logs/*
 *.md
 .idea
+.env
