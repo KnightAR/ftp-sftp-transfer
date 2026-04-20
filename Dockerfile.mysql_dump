@@ -82,7 +82,7 @@ RUN set -eux; \
     apt-get update && apt-get install -y --no-install-recommends g++ make && \
     rm -rf /var/lib/apt/lists/*; \
     wget -q -O /tmp/zpaqfranz.tar.gz \
-        "https://github.com/fcorbelli/zpaqfranz/archive/refs/tags/v${ZPAQFRANZ_VERSION}.tar.gz"; \
+        "https://github.com/fcorbelli/zpaqfranz/archive/refs/tags/${ZPAQFRANZ_VERSION}.tar.gz"; \
     tar -xzf /tmp/zpaqfranz.tar.gz -C /tmp; \
     cd /tmp/zpaqfranz-${ZPAQFRANZ_VERSION}; \
     g++ -O3 -o /usr/local/bin/zpaqfranz zpaqfranz.cpp -lpthread; \
