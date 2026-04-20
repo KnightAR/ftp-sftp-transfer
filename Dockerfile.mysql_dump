@@ -35,7 +35,7 @@
 FROM debian:bookworm-slim
 
 # Build arguments for version pinning
-ARG ZPAQFRANZ_VERSION="60.5"
+ARG ZPAQFRANZ_VERSION="64.7"
 ARG MC_ARCH="linux-amd64"
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -78,21 +78,15 @@ RUN set -eux; \
 # Falls back to building from source if binary not available.
 # ============================================================
 RUN set -eux; \
-    ZPAQ_URL="https://github.com/fcorbelli/zpaqfranz/releases/download/v${ZPAQFRANZ_VERSION}/zpaqfranz-linux-amd64"; \
-    if wget -q -O /usr/local/bin/zpaqfranz "${ZPAQ_URL}" 2>/dev/null; then \
-        chmod +x /usr/local/bin/zpaqfranz; \
-        echo "zpaqfranz downloaded from GitHub"; \
-    else \
-        echo "Binary not found at ${ZPAQ_URL} — building from source"; \
-        apt-get update && apt-get install -y --no-install-recommends g++ make && \
-        rm -rf /var/lib/apt/lists/*; \
-        wget -q -O /tmp/zpaqfranz.tar.gz \
-            "https://github.com/fcorbelli/zpaqfranz/archive/refs/tags/v${ZPAQFRANZ_VERSION}.tar.gz"; \
-        tar -xzf /tmp/zpaqfranz.tar.gz -C /tmp; \
-        cd /tmp/zpaqfranz-${ZPAQFRANZ_VERSION}; \
-        g++ -O3 -o /usr/local/bin/zpaqfranz zpaqfranz.cpp -lpthread; \
-        rm -rf /tmp/zpaqfranz*; \
-    fi; \
+    echo "Building from source"; \
+    apt-get update && apt-get install -y --no-install-recommends g++ make && \
+    rm -rf /var/lib/apt/lists/*; \
+    wget -q -O /tmp/zpaqfranz.tar.gz \
+        "https://github.com/fcorbelli/zpaqfranz/archive/refs/tags/v${ZPAQFRANZ_VERSION}.tar.gz"; \
+    tar -xzf /tmp/zpaqfranz.tar.gz -C /tmp; \
+    cd /tmp/zpaqfranz-${ZPAQFRANZ_VERSION}; \
+    g++ -O3 -o /usr/local/bin/zpaqfranz zpaqfranz.cpp -lpthread; \
+    rm -rf /tmp/zpaqfranz*; \
     zpaqfranz 2>&1 | head -2 || true
 
 # ============================================================

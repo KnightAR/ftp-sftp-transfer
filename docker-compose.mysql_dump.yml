@@ -29,7 +29,7 @@ services:
       dockerfile: Dockerfile.mysql_dump
       args:
         # Pin specific zpaqfranz version if needed
-        ZPAQFRANZ_VERSION: "60.5"
+        ZPAQFRANZ_VERSION: "64.7"
 
     image: mysql-dump-zpaq:latest
 
