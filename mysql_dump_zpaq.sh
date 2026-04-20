@@ -99,7 +99,11 @@ ERROR_LOG_FILE=""
 LOG_DIR=""
 RUN_TIMESTAMP=""
 RUN_DIR=""            # DUMP_TMPDIR/<run_timestamp> — ephemeral per-run working dir
-BACKUP_HOSTNAME=""    # resolved from config/env/hostname
+# BACKUP_HOSTNAME is intentionally NOT pre-initialized here.
+# Leaving it unset allows load_dump_config() to correctly detect whether
+# it was injected as an environment variable (Docker) and preserve it.
+# Pre-initializing to "" would cause the env snapshot to capture the empty
+# string and restore it over the real env var value.
 
 # Per-run stats
 STAT_DB_TOTAL=0
@@ -487,17 +491,22 @@ process_one_db() {
 
     (( STAT_DB_DUMPED++ )) || true
 
-    # Skip empty dumps — a zero-byte .sql is not a valid backup.
-    # This can happen when mysqldump succeeds but the database is truly empty
-    # (no tables, no data). Uploading and archiving an empty file wastes space
-    # and pollutes the zpaq archive with useless blocks.
+    # Skip empty dumps — mysqldump always writes a header (~500 bytes of SQL
+    # comments and SET statements) even for databases with no tables or data.
+    # We check for meaningful content by looking for any CREATE TABLE, INSERT,
+    # or CREATE VIEW statement. A header-only dump has none of these.
     local _sql_size=0
+    local _sql_has_content=false
     if [[ "${CLI_DRY_RUN}" == false && -f "${_db_sql_out}" ]]; then
         _sql_size=$(stat -c "%s" "${_db_sql_out}" 2>/dev/null || echo 0)
+        if grep -qE '^\s*(CREATE TABLE|INSERT INTO|CREATE VIEW|CREATE PROCEDURE|CREATE FUNCTION|CREATE TRIGGER|CREATE EVENT)' \
+                "${_db_sql_out}" 2>/dev/null; then
+            _sql_has_content=true
+        fi
     fi
 
-    if [[ "${CLI_DRY_RUN}" == false ]] && (( _sql_size == 0 )); then
-        log "WARN" "[${db_name}] Dump produced an empty file — skipping upload and zpaq"
+    if [[ "${CLI_DRY_RUN}" == false ]] && [[ "${_sql_has_content}" == false ]]; then
+        log "WARN" "[${db_name}] Dump contains no tables or data (header-only, ${_sql_size} bytes) — skipping upload and zpaq"
         rm -f "${_db_sql_out}" "${_db_sha_out}"
         DB_RESULTS["${db_name}"]="SKIPPED:empty"
         (( STAT_DB_SKIPPED++ )) || true
