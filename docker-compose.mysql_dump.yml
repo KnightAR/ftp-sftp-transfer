@@ -127,6 +127,7 @@ services:
     # ============================================================
     # If MySQL is in the same compose stack, add its network here:
     networks:
+      - default
       - cg-mysql
     #
     # If MySQL is on the Docker host or an external server, use
