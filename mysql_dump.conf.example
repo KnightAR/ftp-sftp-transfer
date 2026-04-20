@@ -144,6 +144,23 @@ DUMP_XZ_LEVEL="6"
 # Set to 0 for auto (use all cores) or a specific number.
 DUMP_XZ_THREADS="1"
 
+# Maximum expected size of a single compressed .sql.xz upload in GiB.
+# Used to calculate mc pipe --part-size so multipart uploads never exceed
+# 9,000 parts (leaving headroom below OVH's 10,000-part hard limit).
+#
+# Formula: part_size = ceil(MAX_SIZE_GB * 1024 / 9000)
+#   clamped to a minimum of 15 MiB (AWS CLI default) and
+#   a maximum of 500 MiB (memory guard — mc buffers one part at a time).
+#
+# Examples:
+#   50  GiB → 15 MiB parts  (max object:  150 GiB, 10,000 parts)
+#   200 GiB → 23 MiB parts  (max object:  230 GiB, 10,000 parts)
+#   500 GiB → 57 MiB parts  (max object:  570 GiB, 10,000 parts)
+#   4000 GiB → 455 MiB parts (max object: 4.5 TiB, 10,000 parts)
+#
+# OVH S3 limits: min 5 MiB, max 5 GiB per part, max 10,000 parts total.
+DUMP_XZ_MAX_SIZE_GB="50"
+
 # ============================================================
 # Backup Mode
 # ============================================================

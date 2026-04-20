@@ -391,9 +391,44 @@ dump_grants() {
 }
 
 # ---------------------------------------------------------------------------
+# calc_mc_part_size_mib
+#
+# Calculates the mc pipe --part-size value in MiB based on
+# DUMP_XZ_MAX_SIZE_GB (the largest single .sql.xz object we expect to
+# ever upload). The goal is to stay well under OVH's 10,000-part limit
+# while keeping individual parts small enough to be memory-friendly.
+#
+# Formula:
+#   part_size = ceil(max_size_mib / 9000)   # 9000 parts headroom
+#   part_size = max(part_size, 15)           # never below 15 MiB (AWS default)
+#   part_size = min(part_size, 500)          # cap at 500 MiB (memory guard)
+#
+# OVH multipart limits: min 5 MiB, max 5 GiB per part, max 10,000 parts.
+#
+# Echoes the part size in MiB as a plain integer.
+# ---------------------------------------------------------------------------
+calc_mc_part_size_mib() {
+    local max_size_gb="${DUMP_XZ_MAX_SIZE_GB:-50}"
+    local max_size_mib=$(( max_size_gb * 1024 ))
+
+    local part_mib
+    part_mib=$(python3 -c "
+import math
+max_mib = ${max_size_mib}
+part = math.ceil(max_mib / 9000)
+part = max(part, 15)
+part = min(part, 500)
+print(part)
+")
+    echo "${part_mib}"
+}
+
+# ---------------------------------------------------------------------------
 # upload_xz_to_s3 SQL_FILE DB_NAME TIMESTAMP
 #
 # xz-compresses SQL_FILE and pipes to mc pipe.
+# Sets Content-Type to application/x-xz and uses a calculated --part-size
+# so multipart uploads stay within OVH's 10,000-part limit.
 # Also uploads the .sha256 sidecar.
 # Verifies the remote xz object via mc stat after upload.
 # Returns 0 on success, 1 on failure.
@@ -419,12 +454,19 @@ upload_xz_to_s3() {
         return 0
     fi
 
+    # Calculate part size for this upload
+    local part_mib
+    part_mib=$(calc_mc_part_size_mib)
+    log "DEBUG" "upload_xz_to_s3: [${db_name}] mc part-size=${part_mib}MiB (DUMP_XZ_MAX_SIZE_GB=${DUMP_XZ_MAX_SIZE_GB:-50})"
+
     # Phase 2: xz compress → mc pipe (streaming, no local xz file)
     local upload_rc=0
     nice -n19 ionice -c3 \
         xz "-${DUMP_XZ_LEVEL:-6}" -T"${DUMP_XZ_THREADS:-1}" -c "${sql_file}" \
         2>>"${ERROR_LOG_FILE:-/dev/stderr}" \
         | mc pipe "${s3_xz_path}" \
+            --attr "Content-Type=application/x-xz" \
+            --part-size "${part_mib}MiB" \
         || upload_rc=$?
 
     if (( upload_rc != 0 )); then

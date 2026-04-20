@@ -143,7 +143,7 @@ Config variables (mysql_dump.conf or environment):
   ZPAQ_LOCAL_DIR, ZPAQ_METHOD, ZPAQ_FRAGMENT
   BACKUP_HOSTNAME         (zpaq archive basename; default: hostname)
   DUMP_TMPDIR, DUMP_MODE
-  DUMP_XZ_LEVEL, DUMP_XZ_THREADS
+  DUMP_XZ_LEVEL, DUMP_XZ_THREADS, DUMP_XZ_MAX_SIZE_GB
   LOG_DIR, LOG_RETENTION_DAYS
 
 See mysql_dump.conf.example for full documentation.
@@ -260,6 +260,7 @@ load_dump_config() {
     # Compression
     : "${DUMP_XZ_LEVEL:=6}"
     : "${DUMP_XZ_THREADS:=1}"
+    : "${DUMP_XZ_MAX_SIZE_GB:=50}"
 
     # Mode
     : "${DUMP_MODE:=combined}"

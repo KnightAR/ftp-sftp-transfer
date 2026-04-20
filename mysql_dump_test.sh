@@ -140,6 +140,7 @@ _load_config() {
     : "${S3_INSECURE:=}"
     : "${S3_MYSQL_PREFIX:=mysql}"
     : "${S3_ZPAQ_PREFIX:=zpaq}"
+    : "${DUMP_XZ_MAX_SIZE_GB:=50}"
 }
 
 # ============================================================
@@ -204,6 +205,7 @@ _show_config() {
     _info "S3_MYSQL_PREFIX  = ${S3_MYSQL_PREFIX}"
     _info "S3_ZPAQ_PREFIX   = ${S3_ZPAQ_PREFIX}"
     _info "S3_INSECURE      = ${S3_INSECURE:-(not set)}"
+    _info "DUMP_XZ_MAX_SIZE_GB = ${DUMP_XZ_MAX_SIZE_GB}"
 }
 
 # ============================================================
@@ -380,9 +382,25 @@ _test_s3() {
     local probe_path="${MC_ALIAS}/${S3_BUCKET}/${probe_key}"
     local probe_content="mysql_dump_zpaq connection test $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
+    # Calculate part size using the same formula as calc_mc_part_size_mib()
+    # in mysql_dump_ops.sh (inlined here — test script does not source modules).
+    local probe_part_mib
+    probe_part_mib=$(python3 -c "
+import math
+max_mib = int('${DUMP_XZ_MAX_SIZE_GB:-50}') * 1024
+part = math.ceil(max_mib / 9000)
+part = max(part, 15)
+part = min(part, 500)
+print(part)
+")
+    _info "mc part-size: ${probe_part_mib}MiB (DUMP_XZ_MAX_SIZE_GB=${DUMP_XZ_MAX_SIZE_GB:-50})"
+
     local put_out put_rc=0
     put_out=$(echo "${probe_content}" \
-        | mc pipe "${probe_path}" ${insecure_flag} 2>&1) || put_rc=$?
+        | mc pipe "${probe_path}" \
+            --attr "Content-Type=application/x-xz" \
+            --part-size "${probe_part_mib}MiB" \
+            ${insecure_flag} 2>&1) || put_rc=$?
 
     _vout "mc pipe (probe put) → ${probe_path}" "${put_out}"
 
