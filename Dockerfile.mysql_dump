@@ -86,7 +86,7 @@ RUN set -eux; \
     cd /tmp/zpaqfranz-${ZPAQFRANZ_VERSION}; \
     g++ -O3 -o /usr/local/bin/zpaqfranz zpaqfranz.cpp -lpthread; \
     rm -rf /tmp/zpaqfranz*; \
-    apt-get remove -y g++ make \
+    apt-get remove -y g++ make; \
     rm -rf /var/lib/apt/lists/*; \
     zpaqfranz 2>&1 | head -2 || true
 
