@@ -264,7 +264,7 @@ load_dump_config() {
         MYSQL_DATABASES=()
     fi
     if [[ ! -v MYSQL_IGNORE_DATABASES ]]; then
-        MYSQL_IGNORE_DATABASES=(information_schema mysql performance_schema sys)
+        MYSQL_IGNORE_DATABASES=(information_schema mysql performance_schema sys clubgrid)
     fi
 
     # Grants
