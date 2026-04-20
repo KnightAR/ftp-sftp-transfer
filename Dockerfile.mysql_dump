@@ -109,8 +109,12 @@ COPY src/mysql/mysql_zpaq_ops.sh  src/mysql/mysql_zpaq_ops.sh
 # Main script
 COPY mysql_dump_zpaq.sh           mysql_dump_zpaq.sh
 
+# Connection & credentials test script
+COPY mysql_dump_test.sh           mysql_dump_test.sh
+
 # Set permissions
 RUN chmod +x mysql_dump_zpaq.sh \
+             mysql_dump_test.sh \
              src/core/logging.sh \
              src/zpaq/zpaq_utils.sh \
              src/mysql/mysql_dump_ops.sh \

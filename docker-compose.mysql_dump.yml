@@ -10,6 +10,11 @@
 #   Or via host cron (recommended):
 #     0 3 * * * cd /opt/backups && docker compose -f docker-compose.mysql_dump.yml run --rm mysql-dump
 #
+#   Test MySQL + S3 credentials before first run:
+#     docker compose -f docker-compose.mysql_dump.yml run --rm --entrypoint /opt/mysql_dump/mysql_dump_test.sh mysql-dump
+#     # Add -v for verbose output:
+#     docker compose -f docker-compose.mysql_dump.yml run --rm --entrypoint /opt/mysql_dump/mysql_dump_test.sh mysql-dump -v
+#
 #   Build the image:
 #     docker compose -f docker-compose.mysql_dump.yml build
 #
