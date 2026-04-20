@@ -428,13 +428,18 @@ process_one_db() {
     log "INFO" "===== [${db_name}] Starting backup ====="
 
     # Phase 1: Dump
-    local sql_file sha_file
+    # NOTE: variable names here must NOT match any 'local' variable inside
+    # dump_database() or dump_grants() — bash nameref resolves to the nearest
+    # scope with that name, causing a circular reference if names collide.
+    # dump_database/dump_grants both use internal locals named 'sql_file' and
+    # 'sha_file', so we use distinct names here.
+    local _db_sql_out="" _db_sha_out=""
     local dump_rc=0
 
     if [[ "${db_name}" == "_grants" ]]; then
-        dump_grants "${RUN_DIR}" "${ts}" sql_file sha_file || dump_rc=$?
+        dump_grants "${RUN_DIR}" "${ts}" _db_sql_out _db_sha_out || dump_rc=$?
     else
-        dump_database "${db_name}" "${RUN_DIR}" "${ts}" sql_file sha_file || dump_rc=$?
+        dump_database "${db_name}" "${RUN_DIR}" "${ts}" _db_sql_out _db_sha_out || dump_rc=$?
     fi
 
     if (( dump_rc != 0 )); then
@@ -447,15 +452,15 @@ process_one_db() {
     (( STAT_DB_DUMPED++ )) || true
 
     # Record size in history for future disk space estimates
-    if [[ "${CLI_DRY_RUN}" == false && -f "${sql_file}" ]]; then
+    if [[ "${CLI_DRY_RUN}" == false && -f "${_db_sql_out}" ]]; then
         local sql_size
-        sql_size=$(stat -c "%s" "${sql_file}" 2>/dev/null || echo 0)
+        sql_size=$(stat -c "%s" "${_db_sql_out}" 2>/dev/null || echo 0)
         _DUMP_SIZE_HISTORY["${db_name}"]="${sql_size}"
     fi
 
     # Phase 2: xz → S3
     local upload_rc=0
-    upload_xz_to_s3 "${sql_file}" "${db_name}" "${ts}" || upload_rc=$?
+    upload_xz_to_s3 "${_db_sql_out}" "${db_name}" "${ts}" || upload_rc=$?
 
     if (( upload_rc != 0 )); then
         log "ERROR" "[${db_name}] S3 upload failed"

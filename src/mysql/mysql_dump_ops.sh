@@ -259,16 +259,19 @@ dump_database() {
         --triggers
         --events
         --set-gtid-purged=OFF
+        --no-tablespaces
         --default-character-set=utf8mb4
         "${db_name}"
     )
 
-    # Dump: pipe through tee to capture sha256 of raw stream while writing to disk
-    # The sha256sum process substitution writes the hash to the .sha256 file
+    # Dump: pipe through tee to capture sha256 of raw stream while writing to disk.
+    # Stderr is captured to a temp file so we can log it on failure.
+    local dump_stderr_file
+    dump_stderr_file="${sql_file}.stderr"
     local dump_rc=0
     nice -n19 ionice -c3 \
         mysqldump "${mysql_dump_args[@]}" \
-        2>>"${ERROR_LOG_FILE:-/dev/stderr}" \
+        2>"${dump_stderr_file}" \
         | tee >(sha256sum | awk '{print $1}' > "${sha_file}") \
         > "${sql_file}" \
         || dump_rc=$?
@@ -279,6 +282,18 @@ dump_database() {
         sleep 0.2
         (( _wait++ )) || true
     done
+
+    # Always log any stderr output (warnings are common and useful to see)
+    if [[ -s "${dump_stderr_file}" ]]; then
+        local _lvl="WARN"
+        (( dump_rc != 0 )) && _lvl="ERROR"
+        while IFS= read -r _dline; do
+            log "${_lvl}" "dump_database: [${db_name}] mysqldump: ${_dline}"
+        done < "${dump_stderr_file}"
+        # Also append to error log for persistent record
+        cat "${dump_stderr_file}" >> "${ERROR_LOG_FILE:-/dev/stderr}" 2>/dev/null || true
+    fi
+    rm -f "${dump_stderr_file}"
 
     if (( dump_rc != 0 )); then
         log "ERROR" "dump_database: [${db_name}] mysqldump failed (rc=${dump_rc})"
@@ -334,12 +349,19 @@ dump_grants() {
     _mysql_args mysql_args
 
     # Get list of user@host pairs
-    local user_list
-    if ! user_list=$(mysql "${mysql_args[@]}" \
+    local user_list user_list_err user_list_rc=0
+    user_list=$(mysql "${mysql_args[@]}" \
             --batch --skip-column-names \
             -e "SELECT CONCAT(QUOTE(user),'@',QUOTE(host)) FROM mysql.user ORDER BY user, host;" \
-            2>/dev/null); then
-        log "ERROR" "dump_grants: failed to query mysql.user"
+            2>"${sql_file}.mysql_stderr") || user_list_rc=$?
+    if [[ -s "${sql_file}.mysql_stderr" ]]; then
+        while IFS= read -r _gline; do
+            log "WARN" "dump_grants: mysql.user query: ${_gline}"
+        done < "${sql_file}.mysql_stderr"
+    fi
+    rm -f "${sql_file}.mysql_stderr"
+    if (( user_list_rc != 0 )); then
+        log "ERROR" "dump_grants: failed to query mysql.user (rc=${user_list_rc})"
         return 1
     fi
 
